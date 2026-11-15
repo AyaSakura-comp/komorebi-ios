@@ -6,6 +6,27 @@ import KomorebiCore
 import KomorebiIPC
 import UIKit
 
+/// Lets the audio tap drop buffers while the microphone session is only on standby (thread-safe).
+private final class AudioGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var open = false
+    private var passed: UInt64 = 0
+
+    var isOpen: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return open }
+        set { lock.lock(); open = newValue; lock.unlock() }
+    }
+
+    /// Counts and admits a buffer when open.
+    func admit() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if open { passed &+= 1 }
+        return open
+    }
+
+    var passedBuffers: UInt64 { lock.lock(); defer { lock.unlock() }; return passed }
+}
+
 public enum DictationMode: String, CaseIterable, Codable, Sendable {
     case sentence = "sentence"
     case draft = "draft"
@@ -28,6 +49,20 @@ public final class AudioPipelineManager: ObservableObject {
     @Published public private(set) var isEngineLoaded: Bool = false
     @Published public private(set) var isLoadingModels: Bool = false
     @Published public private(set) var micLevel: Float = 0
+    /// The microphone session is running but not listening: the keyboard can start listening again without
+    /// opening the app, because iOS only lets an app *start* recording while it is in the foreground.
+    @Published public private(set) var micStandby: Bool = false
+    public private(set) var micStandbyUntil: TimeInterval = 0
+    /// Minutes the microphone stays on (standby) after listening stops; 0 turns it off right away.
+    @Published public var micStandbyMinutes: Int {
+        didSet {
+            UserDefaults.standard.set(micStandbyMinutes, forKey: Self.micStandbyDefaultsKey)
+            if micStandby {
+                if micStandbyMinutes == 0 { endMicSession() } else { enterStandby() }
+            }
+        }
+    }
+    public static let micStandbyChoices = [0, 1, 5, 10, 30]
 
     // Editor states (also synced with Keyboard Extension over App Group IPC)
     @Published public var mode: DictationMode = .draft
@@ -35,7 +70,7 @@ public final class AudioPipelineManager: ObservableObject {
         didSet {
             UserDefaults.standard.set(noiseSuppressionEnabled, forKey: Self.noiseSuppressionDefaultsKey)
             guard oldValue != noiseSuppressionEnabled else { return }
-            if isListening {
+            if audioEngine != nil {
                 Task { await restartAudioTapPreservingDraft() }
             } else {
                 publishIPCState(committedText: nil, isDraftReplacement: false)
@@ -52,6 +87,7 @@ public final class AudioPipelineManager: ObservableObject {
     @Published public private(set) var telemetry: KomorebiTelemetry = KomorebiTelemetry()
 
     private static let noiseSuppressionDefaultsKey = "komorebi_noise_suppression_enabled"
+    private static let micStandbyDefaultsKey = "komorebi_mic_standby_minutes"
 
     public let modelManager: ModelManager
     public let refiner = KomorebiRefiner()
@@ -60,6 +96,11 @@ public final class AudioPipelineManager: ObservableObject {
     private var asr: SenseVoiceASR?
 
     private var audioEngine: AVAudioEngine?
+    private nonisolated let audioGate = AudioGate()
+    private var standbyTask: Task<Void, Never>?
+    private var heartbeatTask: Task<Void, Never>?
+    private var engineLoadTask: Task<Void, Never>?
+    private var audioObservers: [NSObjectProtocol] = []
     private var audioConverter: AVAudioConverter?
     private var targetFormat: AVAudioFormat?
 
@@ -99,6 +140,7 @@ public final class AudioPipelineManager: ObservableObject {
             UserDefaults.standard.set(true, forKey: Self.noiseSuppressionDefaultsKey)
         }
         self.noiseSuppressionEnabled = UserDefaults.standard.bool(forKey: Self.noiseSuppressionDefaultsKey)
+        self.micStandbyMinutes = (UserDefaults.standard.object(forKey: Self.micStandbyDefaultsKey) as? Int) ?? 10
         superInitRefresh()
     }
 
@@ -115,7 +157,57 @@ public final class AudioPipelineManager: ObservableObject {
     private func superInitRefresh() {
         refreshSystemMicMode()
         setupDarwinCommandObserver()
+        observeAudioSession()
         publishIPCState(committedText: nil, isDraftReplacement: false)
+    }
+
+    /// A call, Siri or another app can take the microphone; a route change stops the engine. Either way the session
+    /// must not look alive to the keyboard when it is not.
+    private func observeAudioSession() {
+        let nc = NotificationCenter.default
+        audioObservers.append(nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
+            guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  AVAudioSession.InterruptionType(rawValue: raw) == .began else { return }
+            Task { @MainActor in self?.handleAudioInterruption() }
+        })
+        audioObservers.append(nc.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] note in
+            let engine = note.object as AnyObject?
+            Task { @MainActor in self?.handleEngineConfigurationChange(engine) }
+        })
+    }
+
+    private func handleAudioInterruption() {
+        guard audioEngine != nil else { return }
+        let wasListening = isListening
+        diag("audio session interrupted (listening=\(wasListening))")
+        teardownMicSession()
+        phase = refineTaskRunning ? .refining : .idle
+        statusBanner = wasListening ? "麥克風被中斷（來電或其他 App），請再點一次語音輸入" : "麥克風待命被中斷"
+        publishIPCState(committedText: nil, isDraftReplacement: false)
+    }
+
+    private func handleEngineConfigurationChange(_ object: AnyObject?) {
+        guard let engine = audioEngine, object === engine, !engine.isRunning else { return }
+        diag("audio engine configuration changed; restarting the microphone")
+        Task { await restartAudioTapPreservingDraft() }
+    }
+
+    /// Appends a line to Documents/komorebi-diag.log (and the console) for checking the microphone session on a device.
+    func diag(_ message: String) {
+        let line = "\(ISO8601DateFormatter().string(from: Date())) [\(UIApplication.shared.applicationState == .background ? "bg" : "fg")] \(message)\n"
+        NSLog("KOMOREBI_DIAG %@", message)
+        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("komorebi-diag.log")
+        if let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int, size > 256_000 {
+            try? FileManager.default.removeItem(at: url)
+        }
+        guard let data = line.data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? data.write(to: url)
+        }
     }
 
     public func refreshSystemMicMode() {
@@ -137,8 +229,21 @@ public final class AudioPipelineManager: ObservableObject {
 
     // MARK: - Model Loading
 
+    /// Loads VAD, ASR and Gemma once; a caller that arrives while a load is running waits for it (the keyboard's
+    /// first tap opens the app, whose launch is already loading, and must still end up listening).
     public func loadAllEnginesIfNeeded() async {
-        guard !isLoadingModels else { return }
+        if isEngineLoaded { return }
+        if let running = engineLoadTask {
+            await running.value
+            return
+        }
+        let task = Task { @MainActor in await self.performEngineLoad() }
+        engineLoadTask = task
+        await task.value
+        engineLoadTask = nil
+    }
+
+    private func performEngineLoad() async {
         modelManager.scanInstalledModels()
         guard modelManager.coreModelsReady,
               let sileroURL = modelManager.sileroURL,
@@ -152,6 +257,7 @@ public final class AudioPipelineManager: ObservableObject {
 
         isLoadingModels = true
         statusBanner = "載入 Silero VAD、SenseVoice 與 Gemma 4 E2B…"
+        publishIPCState(committedText: nil, isDraftReplacement: false)
         let loadStart = CFAbsoluteTimeGetCurrent()
 
         do {
@@ -211,33 +317,122 @@ public final class AudioPipelineManager: ObservableObject {
         }
     }
 
-    public func startListening() async {
+    public var isMicLive: Bool { audioEngine != nil }
+    /// Audio buffers that reached VAD since launch (diagnostics / self-test).
+    public var processedAudioBuffers: UInt64 { audioGate.passedBuffers }
+
+    /// Starts listening. A new microphone session needs the app in the foreground; while one is running (listening
+    /// or standby) this also works in the background, which is how the keyboard starts again without opening the app.
+    /// `returnToCaller`: after the microphone starts, go back to the app that opened Komorebi (keyboard's first tap).
+    public func startListening(returnToCaller: Bool = false) async {
+        if isListening { return }
+        if audioEngine == nil {
+            await waitUntilActive(timeout: 2)
+            let granted = await requestMicPermission()
+            guard granted else {
+                phase = .error
+                statusBanner = "請至系統設定開啟麥克風權限。"
+                publishIPCState(committedText: nil, isDraftReplacement: false)
+                return
+            }
+            do {
+                try startAudioCaptureEngine(resetVAD: true)
+                startHeartbeat()
+                diag("microphone session started")
+            } catch {
+                diag("microphone session failed: \(error.localizedDescription)")
+                phase = .error
+                statusBanner = "啟動麥克風失敗：\(error.localizedDescription)"
+                publishIPCState(committedText: nil, isDraftReplacement: false)
+                return
+            }
+        }
+        if returnToCaller {
+            diag("return to the previous app: \(SystemNavigation.returnToPreviousApp())")
+        }
         if !isEngineLoaded {
+            publishIPCState(committedText: nil, isDraftReplacement: false)
             await loadAllEnginesIfNeeded()
         }
-        guard isEngineLoaded, vad != nil, asr != nil else { return }
-        if isListening { return }
-
-        let granted = await requestMicPermission()
-        guard granted else {
-            phase = .error
-            statusBanner = "請至系統設定開啟麥克風權限。"
+        guard isEngineLoaded, vad != nil, asr != nil else {
+            enterStandby()
             publishIPCState(committedText: nil, isDraftReplacement: false)
             return
         }
+        cancelStandby()
+        vad?.reset()
+        micStandby = false
+        micStandbyUntil = 0
+        isListening = true
+        audioGate.isOpen = true
+        phase = .listening
+        let nsTag = hardwareVoiceProcessingActive ? "iOS 降噪開啟" : (noiseSuppressionEnabled ? "系統語音模式" : "原始收音")
+        statusBanner = "聆聽中（\(nsTag)，可切至任意 App 使用鍵盤）"
+        refreshSystemMicMode()
+        diag("listening")
+        publishIPCState(committedText: nil, isDraftReplacement: false)
+    }
 
-        do {
-            try startAudioCaptureEngine(resetVAD: true)
-            self.isListening = true
-            self.phase = .listening
-            let nsTag = hardwareVoiceProcessingActive ? "iOS 降噪開啟" : (noiseSuppressionEnabled ? "系統語音模式" : "原始收音")
-            self.statusBanner = "聆聽中（\(nsTag)，可切至任意 App 使用鍵盤）"
-            refreshSystemMicMode()
-            publishIPCState(committedText: nil, isDraftReplacement: false)
-        } catch {
-            phase = .error
-            statusBanner = "啟動麥克風失敗：\(error.localizedDescription)"
-            publishIPCState(committedText: nil, isDraftReplacement: false)
+    private func waitUntilActive(timeout: Double) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while UIApplication.shared.applicationState != .active && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
+    /// Keeps the microphone session alive (audio is dropped) for `micStandbyMinutes`.
+    private func enterStandby() {
+        guard audioEngine != nil else { return }
+        guard micStandbyMinutes > 0 else {
+            teardownMicSession()
+            return
+        }
+        micStandby = true
+        let seconds = Double(micStandbyMinutes) * 60
+        micStandbyUntil = Date().timeIntervalSince1970 + seconds
+        standbyTask?.cancel()
+        standbyTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard let self, !Task.isCancelled, self.micStandby, !self.isListening else { return }
+            self.diag("standby ended")
+            self.teardownMicSession()
+            self.statusBanner = "麥克風待命結束，已關閉"
+            self.publishIPCState(committedText: nil, isDraftReplacement: false)
+        }
+    }
+
+    private func cancelStandby() {
+        standbyTask?.cancel()
+        standbyTask = nil
+    }
+
+    /// Stops the engine and releases the microphone; the next start needs the app in the foreground again.
+    private func teardownMicSession() {
+        audioGate.isOpen = false
+        cancelStandby()
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        micStandby = false
+        micStandbyUntil = 0
+        audioEngine?.inputNode.removeTap(onBus: 0)
+        audioEngine?.stop()
+        audioEngine = nil
+        audioConverter = nil
+        hardwareVoiceProcessingActive = false
+        isListening = false
+        micLevel = 0
+        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+    }
+
+    /// While the microphone session runs, republish state every 2 s so the keyboard knows the host is reachable.
+    private func startHeartbeat() {
+        heartbeatTask?.cancel()
+        heartbeatTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard let self, self.audioEngine != nil else { return }
+                self.publishIPCState(committedText: nil, isDraftReplacement: false)
+            }
         }
     }
 
@@ -310,7 +505,7 @@ public final class AudioPipelineManager: ObservableObject {
     }
 
     private func restartAudioTapPreservingDraft() async {
-        guard isListening else { return }
+        guard audioEngine != nil else { return }
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         audioEngine = nil
@@ -318,37 +513,46 @@ public final class AudioPipelineManager: ObservableObject {
         do {
             try startAudioCaptureEngine(resetVAD: false)
             let nsTag = hardwareVoiceProcessingActive ? "iOS 降噪開啟" : (noiseSuppressionEnabled ? "系統語音模式" : "原始收音")
-            self.statusBanner = "聆聽中（\(nsTag)）"
+            self.statusBanner = isListening ? "聆聽中（\(nsTag)）" : statusBanner
             refreshSystemMicMode()
             publishIPCState(committedText: nil, isDraftReplacement: false)
         } catch {
-            isListening = false
-            hardwareVoiceProcessingActive = false
+            diag("microphone restart failed: \(error.localizedDescription)")
+            teardownMicSession()
             phase = .error
-            statusBanner = "切換降噪重啟麥克風失敗：\(error.localizedDescription)"
+            statusBanner = "重啟麥克風失敗：\(error.localizedDescription)"
             publishIPCState(committedText: nil, isDraftReplacement: false)
         }
     }
 
-    public func stopListening() {
-        audioEngine?.inputNode.removeTap(onBus: 0)
-        audioEngine?.stop()
-        audioEngine = nil
-        audioConverter = nil
+    /// Stops listening. With `keepMicWarm` the microphone session stays on standby for `micStandbyMinutes`, so the
+    /// keyboard can start again without opening the app; otherwise the microphone is released.
+    public func stopListening(keepMicWarm: Bool = true) {
+        let wasListening = isListening
+        audioGate.isOpen = false
         isListening = false
-        hardwareVoiceProcessingActive = false
         micLevel = 0
-
-        if let vad {
+        if wasListening, let vad {
             processingQueue.async { [weak self] in
                 let flushEvents = vad.flush()
                 self?.dispatchVADEvents(flushEvents)
             }
         }
-
+        if keepMicWarm && micStandbyMinutes > 0 && audioEngine != nil {
+            enterStandby()
+            statusBanner = "已暫停；麥克風待命 \(micStandbyMinutes) 分鐘，鍵盤可直接再開始"
+        } else {
+            teardownMicSession()
+            statusBanner = "已停止聆聽"
+        }
+        diag(micStandby ? "stopped; standby \(micStandbyMinutes) min" : "stopped; microphone off")
         phase = refineTaskRunning ? .refining : .idle
-        statusBanner = "已暫停聆聽"
         publishIPCState(committedText: nil, isDraftReplacement: false)
+    }
+
+    /// Turns the microphone off now (from standby or while listening).
+    public func endMicSession() {
+        stopListening(keepMicWarm: false)
     }
 
     public func flushCurrentUtterance() {
@@ -432,6 +636,7 @@ public final class AudioPipelineManager: ObservableObject {
         inputFormat: AVAudioFormat,
         desired: AVAudioFormat
     ) {
+        guard audioGate.admit() else { return }  // standby: the session stays alive, the audio is dropped
         let converted: [Float]
         if inputFormat.sampleRate == 16_000 && inputFormat.channelCount == 1 && inputFormat.commonFormat == .pcmFormatFloat32 {
             guard let ch0 = buffer.floatChannelData?[0] else { return }
@@ -666,7 +871,10 @@ public final class AudioPipelineManager: ObservableObject {
             errorMessage: phase == .error ? statusBanner : nil,
             telemetry: telemetry,
             draftEditAck: lastDraftEditID,
-            hostSessionID: hostSessionID
+            hostSessionID: hostSessionID,
+            micLive: audioEngine != nil,
+            micStandbyUntil: micStandby ? micStandbyUntil : 0,
+            enginesLoading: isLoadingModels
         )
         KomorebiIPCStore.shared.writeState(state)
         return ipcCommitID
@@ -725,13 +933,16 @@ public final class AudioPipelineManager: ObservableObject {
 
         switch cmd.action {
         case .startListening:
-            if UIApplication.shared.applicationState == .background {
-                pendingStartListeningOnForeground = true
-            } else {
+            if audioEngine != nil || UIApplication.shared.applicationState != .background {
+                diag("keyboard: start listening")
                 Task { await startListening() }
+            } else {
+                pendingStartListeningOnForeground = true
             }
         case .stopListening:
-            stopListening()
+            stopListening(keepMicWarm: true)
+        case .endMicSession:
+            endMicSession()
         case .flushUtterance:
             flushCurrentUtterance()
         case .resetDraft:

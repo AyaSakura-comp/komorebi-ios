@@ -34,7 +34,7 @@ struct KeyboardView: View {
     @Environment(\.colorScheme) private var scheme
 
     private var isListening: Bool {
-        bridge.state.audioSessionActive
+        bridge.isListening
     }
 
     var body: some View {
@@ -63,7 +63,20 @@ struct KeyboardView: View {
 
             Spacer()
 
-            if bridge.state.telemetry.decodeTPS > 0 {
+            if bridge.micOnStandby {
+                Button {
+                    bridge.endMicSession()
+                } label: {
+                    Text("關麥")
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(KeyboardPalette.subtle(scheme))
+                        .foregroundStyle(KeyboardPalette.persimmon(scheme))
+                        .clipShape(Capsule())
+                }
+                .accessibilityLabel("關閉待命中的麥克風")
+            } else if bridge.state.telemetry.decodeTPS > 0 {
                 Text("\(bridge.state.telemetry.backendUsed.components(separatedBy: " ").first ?? "") \(String(format: "%.0f", bridge.state.telemetry.decodeTPS))t/s")
                     .font(.caption2.monospaced())
                     .foregroundStyle(KeyboardPalette.muted(scheme))
@@ -125,8 +138,13 @@ struct KeyboardView: View {
                         .font(.caption)
                         .foregroundStyle(KeyboardPalette.muted(scheme))
                         .lineLimit(2)
+                } else if bridge.micOnStandby {
+                    Text("麥克風待命中：點「語音輸入」直接開始，不會跳到 App。「定稿」＝保留現有文字，之後另起新草稿")
+                        .font(.caption)
+                        .foregroundStyle(KeyboardPalette.muted(scheme))
+                        .lineLimit(2)
                 } else {
-                    Text("點麥克風開始（離線）。說的話會整理成草稿放在輸入框；「定稿」＝保留現有文字，之後另起新草稿")
+                    Text("點麥克風開始（第一次會切到 App 開麥克風再切回來）。說的話會整理成草稿放在輸入框")
                         .font(.caption)
                         .foregroundStyle(KeyboardPalette.muted(scheme))
                         .lineLimit(2)
@@ -254,12 +272,18 @@ struct KeyboardView: View {
 
     private var statusLabel: String {
         if !bridge.hasFullAccess { return "需要「允許完整取用」" }
+        if !bridge.hostReachable && bridge.state.phase != .idle {
+            return bridge.state.modelsReady ? "Komorebi 就緒" : "請先於主 App 下載模型"
+        }
         switch bridge.state.phase {
         case .listening: return "聆聽中（Komorebi）"
         case .transcribing: return "SenseVoice 辨識中…"
         case .refining: return "Gemma 4 E2B 潤飾中…"
         case .error: return bridge.state.errorMessage ?? "發生錯誤"
-        case .idle: return bridge.state.modelsReady ? "Komorebi 就緒" : "請先於主 App 下載模型"
+        case .idle:
+            if bridge.state.enginesLoading && bridge.hostReachable { return "載入模型中…" }
+            if bridge.micOnStandby { return "麥克風待命中" }
+            return bridge.state.modelsReady ? "Komorebi 就緒" : "請先於主 App 下載模型"
         }
     }
 }

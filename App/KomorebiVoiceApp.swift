@@ -31,7 +31,11 @@ struct KomorebiVoiceApp: App {
                 .task {
                     modelManager.scanInstalledModels()
                     if modelManager.coreModelsReady && !ANEDirectBench.isActive {
-                        await pipeline.loadAllEnginesIfNeeded()
+                        if MicSelfTest.isActive {
+                            await MicSelfTest.run(pipeline: pipeline)
+                        } else {
+                            await pipeline.loadAllEnginesIfNeeded()
+                        }
                     }
                 }
         }
@@ -40,8 +44,10 @@ struct KomorebiVoiceApp: App {
     private func handleIncomingURL(_ url: URL) {
         guard url.scheme == KomorebiAppConfig.urlScheme else { return }
         if url.host == "listen" {
+            // Opened by the keyboard: start the microphone, then go straight back to the app the user was typing in.
+            pipeline.diag("keyboard opened komorebi://listen")
             Task {
-                await pipeline.startListening()
+                await pipeline.startListening(returnToCaller: true)
             }
         } else if url.host == "stop" {
             pipeline.stopListening()

@@ -182,7 +182,8 @@ done
 ## 9. 使用
 
 1. 在任何 App 的輸入框切到 Komorebi 鍵盤（地球鍵）。
-2. 點「語音輸入」。iOS 不讓鍵盤擴充使用麥克風，所以會切到 Komorebi App 開始錄音；點左上角「◀ 返回」或從底部橫滑回到原本的 App。
+2. 點「語音輸入」。iOS 不讓鍵盤擴充使用麥克風，也只允許 App 在前景開始錄音，所以麥克風關著時會切到 Komorebi App 開麥克風，再自動切回原本的 App（沒有切回來的話，點左上角「◀ 返回」）。
+   停止聆聽後麥克風會**待命**（預設 10 分鐘，「模型與效能」頁可改成 1／5／10／30 分鐘或不待命）：這段時間內再點「語音輸入」直接開始，不會跳轉。待命時鍵盤狀態顯示「麥克風待命中」，按「關麥」可以馬上關掉；狀態列的麥克風指示燈會亮著，但聲音不會被處理。來電或其他 App 搶走麥克風時待命會結束。
 3. 直接說話。停頓後句子會被整理成草稿，**草稿就顯示在輸入框裡**；之後說的話會合併進同一份草稿，說「不對，改成…」可以改前面的內容。
 4. 鍵盤按鈕：
    * **⌫**：刪字，草稿會同步（刪掉的字不會被下一句帶回來）。
@@ -203,6 +204,17 @@ xcrun devicectl device process launch --console --terminate-existing --device "$
 # 連續 60 秒測速，每行附上前景/背景、溫度、低耗電模式狀態
 xcrun devicectl device process launch --console --terminate-existing --device "$UDID" \
   dev.ayasakura.komorebi --ane-bench --bg-loop 60 --exit-after
+# 麥克風待命自我測試：前景開始→停止（待命）→看到 READY_FOR_BACKGROUND 後切到別的 App→
+# 由 App Group 送出鍵盤的開始/停止/關麥指令，檢查背景也收得到聲音
+xcrun devicectl device process launch --console --terminate-existing --device "$UDID" \
+  dev.ayasakura.komorebi --mic-selftest --exit-after
+```
+
+App 會把麥克風工作階段的事件（開始、自動返回結果、待命、背景開始、被中斷）寫進 App 的 `Documents/komorebi-diag.log`，可以這樣拿回 Mac：
+
+```bash
+xcrun devicectl device copy from --device "$UDID" --domain-type appDataContainer \
+  --domain-identifier dev.ayasakura.komorebi --source Documents/komorebi-diag.log --destination ./komorebi-diag.log
 ```
 
 正常結果（A16）大約是：`ANE_BENCH build: 4–6 s`、一般解碼 26–27 tok/s、`MTP draft` 約 69 tok/s。
@@ -233,5 +245,6 @@ cd Tools/ane-direct && make && ./probe t1               # ANE 編譯器/頻寬�
 | App 打不開，提示「未受信任的開發者」 | 第 5 步最後：VPN 與裝置管理 → 信任。 |
 | 狀態「就緒：僅語音辨識（Gemma 未載入：…）」 | 看括號裡的原因：GGUF 不在、私有 ANE API 不可用（iOS 版本不同）、模擬器。 |
 | 鍵盤顯示「需要『允許完整取用』」 | 第 7 步打開完整取用。 |
-| 點「語音輸入」每次都會切到 App | 鍵盤不能用麥克風，錄音一定要由主 App 開始；切過去後再返回原 App 即可。 |
+| 點「語音輸入」每次都會切到 App | 只有麥克風關著時才會切（iOS 只允許前景開始錄音）。檢查「模型與效能」的「停止後麥克風待命」不是「不待命」；來電、Siri 或其他 App 用了麥克風也會結束待命。 |
+| 切到 App 後沒有自動切回原本的 App | 自動返回用的是私有 API，iOS 不支援時會記在 `komorebi-diag.log`（`return to the previous app: …`）；點左上角「◀ 返回」即可，之後待命期間不會再切。 |
 | 第一次啟動很久 | 正常：正在轉權重與編譯（A16 約 72 秒），之後約 6 秒。 |

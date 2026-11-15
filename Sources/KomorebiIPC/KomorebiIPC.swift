@@ -94,6 +94,13 @@ public struct KomorebiIPCState: Codable, Equatable, Sendable {
     public var draftEditAck: UInt64
     /// Random per host launch; a change means the host restarted with an empty draft.
     public var hostSessionID: UInt64
+    /// The host's microphone session is running (listening, or on standby). While it runs, the keyboard can start
+    /// listening through IPC without opening the app (iOS only lets an app start recording in the foreground).
+    public var micLive: Bool
+    /// When the standby microphone session ends if listening is not started again (0 = not on standby).
+    public var micStandbyUntil: TimeInterval
+    /// The host is still loading the speech and Gemma engines.
+    public var enginesLoading: Bool
 
     public init(
         sequence: UInt64 = 0,
@@ -113,7 +120,10 @@ public struct KomorebiIPCState: Codable, Equatable, Sendable {
         errorMessage: String? = nil,
         telemetry: KomorebiTelemetry = KomorebiTelemetry(),
         draftEditAck: UInt64 = 0,
-        hostSessionID: UInt64 = 0
+        hostSessionID: UInt64 = 0,
+        micLive: Bool = false,
+        micStandbyUntil: TimeInterval = 0,
+        enginesLoading: Bool = false
     ) {
         self.sequence = sequence
         self.updatedAt = updatedAt
@@ -133,6 +143,9 @@ public struct KomorebiIPCState: Codable, Equatable, Sendable {
         self.telemetry = telemetry
         self.draftEditAck = draftEditAck
         self.hostSessionID = hostSessionID
+        self.micLive = micLive
+        self.micStandbyUntil = micStandbyUntil
+        self.enginesLoading = enginesLoading
     }
 
     public init(from decoder: Decoder) throws {
@@ -155,6 +168,9 @@ public struct KomorebiIPCState: Codable, Equatable, Sendable {
         telemetry = try c.decodeIfPresent(KomorebiTelemetry.self, forKey: .telemetry) ?? KomorebiTelemetry()
         draftEditAck = try c.decodeIfPresent(UInt64.self, forKey: .draftEditAck) ?? 0
         hostSessionID = try c.decodeIfPresent(UInt64.self, forKey: .hostSessionID) ?? 0
+        micLive = try c.decodeIfPresent(Bool.self, forKey: .micLive) ?? false
+        micStandbyUntil = try c.decodeIfPresent(TimeInterval.self, forKey: .micStandbyUntil) ?? 0
+        enginesLoading = try c.decodeIfPresent(Bool.self, forKey: .enginesLoading) ?? false
     }
 }
 
@@ -180,6 +196,8 @@ public struct KomorebiIPCCommand: Codable, Equatable, Sendable {
     public enum Action: String, Codable, Sendable {
         case startListening
         case stopListening
+        /// Turns the microphone off now instead of leaving it on standby.
+        case endMicSession
         case flushUtterance
         case resetDraft
         case toggleNoiseSuppression

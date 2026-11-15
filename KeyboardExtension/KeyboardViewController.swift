@@ -54,22 +54,34 @@ final class KeyboardBridgeModel: ObservableObject {
         pollTimer = nil
     }
 
+    /// The host answered recently (it republishes every 2 s while its microphone session runs).
+    var hostReachable: Bool {
+        state.hostAppAlive && Date().timeIntervalSince1970 - state.updatedAt < 6
+    }
+
+    var isListening: Bool { state.audioSessionActive && hostReachable }
+
+    /// The host's microphone session is running but not listening: 語音輸入 starts without opening the app.
+    var micOnStandby: Bool { state.micLive && !state.audioSessionActive && hostReachable }
+
     func toggleListening() {
         hasFullAccess = controller?.hasFullAccess ?? false
         if !hasFullAccess { return }
 
-        let now = Date().timeIntervalSince1970
-        let staleHost = !state.hostAppAlive || (now - state.updatedAt > 6.0 && !state.audioSessionActive)
-
-        if state.audioSessionActive {
+        if isListening {
             sendCommand(.stopListening)
-        } else if state.hostInForeground && !staleHost && state.modelsReady {
+        } else if hostReachable && state.modelsReady && (state.micLive || state.hostInForeground) {
+            // The microphone session is still running (standby): start over IPC, no app switch.
             sendCommand(.startListening)
         } else {
-            // Host app cannot acquire a brand-new AVAudioEngine input node while suspended/backgrounded;
-            // open `komorebi://listen` so iOS brings Host App to foreground to start listening cleanly.
+            // Keyboards cannot record, and iOS only lets the app start a microphone session in the foreground:
+            // open `komorebi://listen`; the app starts the microphone and switches back here by itself.
             controller?.openHostURL(KomorebiAppConfig.startListeningURL)
         }
+    }
+
+    func endMicSession() {
+        sendCommand(.endMicSession)
     }
 
     func flushUtterance() {

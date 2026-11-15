@@ -62,6 +62,38 @@ struct ModelBenchmarkView: View {
                     .foregroundStyle(KomorebiTheme.sage(scheme))
                     .clipShape(Capsule())
                 }
+
+                Divider().overlay(KomorebiTheme.border(scheme))
+
+                HStack {
+                    Text("停止後麥克風待命")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(KomorebiTheme.ink(scheme))
+                    Spacer()
+                    Picker("停止後麥克風待命", selection: $pipeline.micStandbyMinutes) {
+                        ForEach(AudioPipelineManager.micStandbyChoices, id: \.self) { minutes in
+                            Text(minutes == 0 ? "不待命" : "\(minutes) 分鐘").tag(minutes)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .tint(KomorebiTheme.sage(scheme))
+                }
+
+                Text("iOS 只允許 App 在前景開始錄音，所以鍵盤第一次點「語音輸入」會切到 Komorebi 開麥克風，並試著自動切回原本的 App。停止聆聽後麥克風會待命這段時間，期間在鍵盤再點「語音輸入」不會跳轉；待命時狀態列會顯示麥克風使用中，但聲音不會被處理。")
+                    .font(.caption)
+                    .foregroundStyle(KomorebiTheme.inkMuted(scheme))
+
+                if pipeline.micStandby {
+                    Button("現在關閉麥克風") {
+                        pipeline.endMicSession()
+                    }
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(KomorebiTheme.subtle(scheme))
+                    .foregroundStyle(KomorebiTheme.persimmon(scheme))
+                    .clipShape(Capsule())
+                }
             }
         }
     }
