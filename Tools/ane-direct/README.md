@@ -36,6 +36,8 @@ Real Komorebi refine prompt (186 tokens), greedy decoding, ANE programs warm.
 
 Reference on the same M4: CoreML ANE package (LUT4 g32, MLState) 33 tok/s decode / ~200 tok/s prefill;
 Metal Q4_0 (after the simdgroup-matrix prefill rewrite) ~40 tok/s decode / ~1150–1330 tok/s prefill.
+(Both of those engines, and a CPU fallback, were removed from the app once this one became the default; they
+remain in the repository's first commit, `6b1f870`.)
 
 Decode profile (LUT4): 36 layer programs ≈ 19.5 ms + LM head 3.4 ms per token ≈ 55 GB/s of LUT4 weights
 (the ANE weight-streaming roofline measured by `probe t3`); CPU attention + PLE + argmax ≈ 1.5 ms.
