@@ -212,7 +212,7 @@ enum ChatSelfTest {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
         chat.clear()
         chat.speakAnswers = false
-        chat.capacity = 900
+        chat.capacity = ProcessInfo.processInfo.arguments.contains("--small-window") ? 900 : ChatModel.contextCapacity
         let turns = ["我今天好累，推薦一個放鬆的方法。", "那晚餐吃什麼好？", "我比較喜歡吃辣的。", "你一開始推薦的放鬆方法是什麼？"]
         for text in turns {
             chat.send(text)

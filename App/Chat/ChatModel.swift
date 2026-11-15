@@ -154,9 +154,13 @@ final class ChatModel: ObservableObject {
                 let s = result.stats
                 self.messages[answerIndex].text = answer.isEmpty ? "……" : answer
                 self.messages[answerIndex].streaming = false
+                let m = result.mtp
+                let mtp = m.steps > 0 ? String(format: " · MTP 命中 %.0f%%（每步 %.2f tok）",
+                                               m.drafted > 0 ? Double(m.accepted) / Double(m.drafted) * 100 : 0,
+                                               Double(m.accepted + m.steps) / Double(m.steps)) : ""
                 self.messages[answerIndex].meta = String(
-                    format: "prefill %d tok（快取 %d）%.0f tok/s · 解碼 %d tok %.1f tok/s · %.1f 秒",
-                    s.prefillTokens, s.prefixCachedTokens, s.prefillTPS, s.decodeTokens, s.decodeTPS,
+                    format: "prefill %d tok（快取 %d）%.0f tok/s · 解碼 %d tok %.1f tok/s%@ · %.1f 秒",
+                    s.prefillTokens, s.prefixCachedTokens, s.prefillTPS, s.decodeTokens, s.decodeTPS, mtp,
                     CFAbsoluteTimeGetCurrent() - started)
                 if self.speakAnswers && !flag.isSet { self.speaker.finish(answer) }
                 self.status = flag.isSet ? "已停止" : "點麥克風跟小葉說話，或打字"

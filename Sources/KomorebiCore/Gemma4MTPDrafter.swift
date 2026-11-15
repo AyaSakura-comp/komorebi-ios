@@ -43,6 +43,12 @@ public final class Gemma4MTPDrafter: @unchecked Sendable {
     private var centroids: UnsafePointer<UInt16>!
     private var embed: UnsafePointer<UInt16>!
     private var ordering: [Int32] = []
+    /// Diagnostics: when > 0, the first draft step of each `propose` keeps its `debugTopK` best candidates and the
+    /// whole candidate set (to tell a near miss from a token the centroid head never offered).
+    public var debugTopK = 0
+    public private(set) var lastTopCandidates: [Int32] = []
+    public private(set) var lastCandidateSet: Set<Int32> = []
+    private var firstStep = false
 
     public init(directory: URL) throws {
         let cfgData = try Data(contentsOf: directory.appendingPathComponent("config.json"))
@@ -169,6 +175,7 @@ public final class Gemma4MTPDrafter: @unchecked Sendable {
         let back = UnsafeMutablePointer<Float>.allocate(capacity: backbone); defer { back.deallocate() }
         back.update(from: targetHidden, count: backbone)
         var tok = token
+        firstStep = true
         for _ in 0..<count {
             targetEmbed(tok, x)
             x.advanced(by: backbone).update(from: back, count: backbone)
@@ -269,6 +276,12 @@ public final class Gemma4MTPDrafter: @unchecked Sendable {
         var best: Float = 0
         var bi: vDSP_Length = 0
         vDSP_maxvi(logits, 1, &best, &bi, vDSP_Length(logits.count))
+        if debugTopK > 0 && firstStep {
+            firstStep = false
+            let order = logits.indices.sorted { logits[$0] > logits[$1] }.prefix(debugTopK)
+            lastTopCandidates = order.map { cand[$0] }
+            lastCandidateSet = Set(cand)
+        }
         gemv(postProj, rows: backbone, cols: H, dh, backboneOut)
         return cand[Int(bi)]
     }

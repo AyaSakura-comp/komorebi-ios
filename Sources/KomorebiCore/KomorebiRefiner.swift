@@ -95,7 +95,7 @@ public actor KomorebiRefiner {
     /// after the cached prefix is prefilled. `onText` receives the answer so far as it streams.
     public func chatGenerate(prompt: [Int32], capacity: Int, maxNewTokens: Int,
                              onText: @escaping @Sendable (String) -> Void,
-                             shouldCancel: (@Sendable () -> Bool)? = nil) throws -> (ids: [Int32], text: String, stats: GenerationStats) {
+                             shouldCancel: (@Sendable () -> Bool)? = nil) throws -> (ids: [Int32], text: String, stats: GenerationStats, mtp: (drafted: Int, accepted: Int, steps: Int)) {
         guard let tokenizer else { throw GemmaEngineError.inferenceFailed("Tokenizer not loaded") }
         let (engine, kv) = try chatSession(capacity: capacity)
         let stops: Set<Int32> = [tokenizer.eosTokenID, tokenizer.turnEndTokenID]
@@ -107,7 +107,8 @@ public actor KomorebiRefiner {
                                     onText(tokenizer.decode(ids, skipSpecialTokens: true))
                                 })
         }
-        return (out, tokenizer.decode(out, skipSpecialTokens: true), stats)
+        let p = engine.decodeProfile
+        return (out, tokenizer.decode(out, skipSpecialTokens: true), stats, (p.draftedTokens, p.acceptedTokens, p.verifySteps))
     }
 
     public func saveChatSession(to url: URL) throws {

@@ -47,6 +47,8 @@ public final class Gemma4ANEDirectEngine: @unchecked Sendable {
         public var glueSeconds: Double = 0
         public var argmaxSeconds: Double = 0
         public var drafterSeconds: Double = 0
+        /// Diagnostics (drafter.debugTopK > 0): where the target's token ranked among the first draft's candidates.
+        public var rankTop1 = 0, rankTop5 = 0, inCandidates = 0, rankChecks = 0
         public var verifySteps: Int = 0
         public var draftedTokens: Int = 0
         public var acceptedTokens: Int = 0
@@ -681,6 +683,13 @@ public final class Gemma4ANEDirectEngine: @unchecked Sendable {
             let g = try forwardChunk(tokens: [pending] + drafts, p0: P + 1, logits: .all)
             var acc = 0
             while acc < drafts.count && drafts[acc] == g[acc] { acc += 1 }
+            if drafter.debugTopK > 0, !drafts.isEmpty {
+                let truth = g[0]
+                lastProfile.rankChecks += 1
+                if drafter.lastTopCandidates.first == truth { lastProfile.rankTop1 += 1 }
+                if drafter.lastTopCandidates.prefix(5).contains(truth) { lastProfile.rankTop5 += 1 }
+                if drafter.lastCandidateSet.contains(truth) { lastProfile.inCandidates += 1 }
+            }
             // Keys/values of the tokens that were right ([pending] + accepted drafts) are now in the cache.
             session.tokens.append(pending)
             session.tokens.append(contentsOf: drafts.prefix(acc))
