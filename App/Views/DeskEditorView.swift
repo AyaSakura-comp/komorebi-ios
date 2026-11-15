@@ -297,46 +297,33 @@ struct DeskEditorView: View {
             Spacer()
 
             Button {
-                if pipeline.isListening {
-                    pipeline.flushCurrentUtterance()
-                } else {
-                    UIPasteboard.general.string = pipeline.editorText
-                    copiedToast = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.3) {
-                        copiedToast = false
-                    }
-                }
+                pipeline.flushCurrentUtterance()
             } label: {
                 VStack(spacing: 3) {
-                    Image(systemName: pipeline.isListening ? "checkmark.circle" : (copiedToast ? "checkmark" : "doc.on.doc"))
+                    Image(systemName: "checkmark.circle")
                         .font(.body)
-                    Text(pipeline.isListening ? "整句" : (copiedToast ? "已複製" : "複製"))
+                    Text("斷句")
                         .font(.caption2)
                 }
                 .frame(width: 48, height: 48)
                 .foregroundStyle(KomorebiTheme.ink(scheme))
                 .background(KomorebiTheme.subtle(scheme))
                 .clipShape(Circle())
+                .opacity(pipeline.isListening ? 1 : 0.4)
             }
+            .disabled(!pipeline.isListening)
 
-            Menu {
-                ForEach(InferenceBackendPreference.allCases, id: \.self) { pref in
-                    Button {
-                        pipeline.backendPreference = pref
-                    } label: {
-                        HStack {
-                            Text(pref.displayName)
-                            if pipeline.backendPreference == pref {
-                                Image(systemName: "checkmark")
-                            }
-                        }
-                    }
+            Button {
+                UIPasteboard.general.string = pipeline.editorText
+                copiedToast = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.3) {
+                    copiedToast = false
                 }
             } label: {
                 VStack(spacing: 3) {
-                    Image(systemName: "cpu")
+                    Image(systemName: copiedToast ? "checkmark" : "doc.on.doc")
                         .font(.body)
-                    Text(backendShortTag(pipeline.backendPreference))
+                    Text(copiedToast ? "已複製" : "複製")
                         .font(.caption2)
                 }
                 .frame(width: 48, height: 48)
@@ -346,15 +333,6 @@ struct DeskEditorView: View {
             }
         }
         .padding(.vertical, 4)
-    }
-
-    private func backendShortTag(_ pref: InferenceBackendPreference) -> String {
-        switch pref {
-        case .auto: return "自動"
-        case .metal: return "Metal"
-        case .ane: return "ANE"
-        case .cpu: return "CPU"
-        }
     }
 
     private func triggerSelectionRewrite() {

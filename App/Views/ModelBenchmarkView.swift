@@ -67,16 +67,12 @@ struct ModelBenchmarkView: View {
     }
 
     private var engineSection: some View {
-        cardContainer(title: "推論引擎路由 (Gemma 4 E2B)") {
-            VStack(alignment: .leading, spacing: 10) {
-                Picker("推論引擎", selection: $pipeline.backendPreference) {
-                    ForEach(InferenceBackendPreference.allCases, id: \.self) { pref in
-                        Text(pref.displayName).tag(pref)
-                    }
-                }
-                .pickerStyle(.menu)
-
-                Text("• 前景主 App：使用純 Metal Q4_0 Zero-Copy Kernel（GPU 加速）。\n• 背景（在其他 App 用語音鍵盤時）：iOS 禁止背景提交 MTLCommandBuffer，自動切換至 ANE CoreML (.cpuAndNeuralEngine) 或 Accelerate CPU。")
+        cardContainer(title: "推論引擎 (Gemma 4 E2B)") {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(pipeline.statusBanner)
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(KomorebiTheme.ink(scheme))
+                Text("Gemma 4 E2B 只跑在 Apple Neural Engine 上（自製 MIL 引擎：LUT4 權重、小字典 LM head、MTP 推測解碼），前景與背景都一樣快，不用 GPU、不燙。第一次啟動會把權重轉成 ANE 格式並編譯（約 1 分鐘），之後幾秒內載入。")
                     .font(.caption)
                     .foregroundStyle(KomorebiTheme.inkMuted(scheme))
             }
@@ -167,7 +163,7 @@ struct ModelBenchmarkView: View {
     }
 
     private var benchmarkSection: some View {
-        cardContainer(title: "實機 Metal / ANE / CPU Prefill & Decode 實測") {
+        cardContainer(title: "ANE Prefill & Decode 實測") {
             VStack(alignment: .leading, spacing: 10) {
                 Button {
                     Task { await runOnDeviceBenchmarks() }
@@ -213,23 +209,12 @@ struct ModelBenchmarkView: View {
         }
 
         let sample = "呃那個我們明天下午三點開會，喔不對不對，改成四點半好不好"
-#if targetEnvironment(simulator)
-        benchResults.append("ane: 模擬器無實體 ANE NPU；以下實測 Metal GPU vs CPU Q4_0：")
-        let prefs: [InferenceBackendPreference] = [.metal, .cpu]
-#else
-        let prefs: [InferenceBackendPreference] = [.metal, .ane, .cpu]
-#endif
-        for pref in prefs {
-            do {
-                let res = try await pipeline.refiner.refineSentence(raw: sample, preference: pref)
-                let line = "\(res.stats.backend): prefill=\(res.stats.prefillTokens) tok @ \(String(format: "%.1f", res.stats.prefillTPS)) t/s | decode=\(res.stats.decodeTokens) tok @ \(String(format: "%.1f", res.stats.decodeTPS)) t/s"
-                benchResults.append(line)
-                if benchOutput.isEmpty {
-                    benchOutput = res.text
-                }
-            } catch {
-                benchResults.append("\(pref.rawValue): \(error.localizedDescription)")
-            }
+        do {
+            let res = try await pipeline.refiner.refineSentence(raw: sample)
+            benchResults.append("\(res.stats.backend): prefill=\(res.stats.prefillTokens) tok @ \(String(format: "%.1f", res.stats.prefillTPS)) t/s | decode=\(res.stats.decodeTokens) tok @ \(String(format: "%.1f", res.stats.decodeTPS)) t/s")
+            benchOutput = res.text
+        } catch {
+            benchResults.append("ANE: \(error.localizedDescription)")
         }
     }
 

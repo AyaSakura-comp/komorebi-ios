@@ -1,5 +1,4 @@
 import SwiftUI
-import BackgroundTasks
 import KomorebiIPC
 
 @main
@@ -9,10 +8,6 @@ struct KomorebiVoiceApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
-        // Diagnostic: does this device allow GPU work in background (BGContinuedProcessingTask .gpu)?
-        if #available(iOS 26.0, *) {
-            NSLog("KOMOREBI_DIAG background_gpu_supported=%@", BGTaskScheduler.supportedResources.contains(.gpu) ? "YES" : "NO")
-        }
         ANEDirectBench.runIfRequested()
         let mm = ModelManager()
         let pipe = AudioPipelineManager(modelManager: mm)

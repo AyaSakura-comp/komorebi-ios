@@ -37,22 +37,6 @@ public enum KomorebiAppConfig {
     }
 }
 
-public enum InferenceBackendPreference: String, Codable, CaseIterable, Sendable {
-    case auto = "auto"
-    case metal = "metal"
-    case ane = "ane"
-    case cpu = "cpu"
-
-    public var displayName: String {
-        switch self {
-        case .auto: return "自動（ANE 直跑，前景背景都用 NPU）"
-        case .metal: return "Metal GPU（較快但較燙）"
-        case .ane: return "ANE 直跑（MIL + MTP 推測解碼）"
-        case .cpu: return "CPU Q4_0 (Accelerate)"
-        }
-    }
-}
-
 public enum DictationPhase: String, Codable, Sendable {
     case idle
     case listening

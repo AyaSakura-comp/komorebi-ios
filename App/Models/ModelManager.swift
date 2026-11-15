@@ -6,7 +6,6 @@ public enum ModelArtifactID: String, CaseIterable, Identifiable, Sendable {
     case sileroVAD = "silero_vad"
     case senseVoiceInt8 = "sensevoice_int8"
     case gemma4GGUFQ4 = "gemma4_q4_0"
-    case gemma4CoreMLANE = "gemma4_ane_coreml"
     case gemma4MTPDrafter = "gemma4_mtp_drafter"
 
     public var id: String { rawValue }
@@ -15,8 +14,7 @@ public enum ModelArtifactID: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .sileroVAD: return "Silero VAD v6.2 (CPU)"
         case .senseVoiceInt8: return "SenseVoice-Small int8 + OpenCC s2twp (CPU)"
-        case .gemma4GGUFQ4: return "Gemma 4 E2B Q4_0 QAT（ANE 直跑 / CPU / Metal）"
-        case .gemma4CoreMLANE: return "Gemma 4 E2B Stateful CoreML（舊 ANE 路徑，選配）"
+        case .gemma4GGUFQ4: return "Gemma 4 E2B Q4_0 QAT（首次啟動轉成 ANE 權重）"
         case .gemma4MTPDrafter: return "Gemma 4 E2B MTP drafter（推測解碼加速）"
         }
     }
@@ -26,13 +24,12 @@ public enum ModelArtifactID: String, CaseIterable, Identifiable, Sendable {
         case .sileroVAD: return "2.3 MB"
         case .senseVoiceInt8: return "228 MB"
         case .gemma4GGUFQ4: return "3.12 GiB"
-        case .gemma4CoreMLANE: return "~3.9 GB（選配）"
         case .gemma4MTPDrafter: return "150 MB（建議，ANE 解碼約快 1.4–2.5 倍）"
         }
     }
 
     public var isRequiredForCore: Bool {
-        self != .gemma4CoreMLANE && self != .gemma4MTPDrafter
+        self != .gemma4MTPDrafter
     }
 }
 
@@ -96,27 +93,6 @@ public final class ModelManager: NSObject, ObservableObject, URLSessionDownloadD
         ])
     }
 
-    public var gemma4CoreMLDirectory: URL? {
-        let docsModels = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("Models/gemma-4-e2b-coreml", isDirectory: true)
-        var candidates = [
-            rootDirectory.appendingPathComponent("gemma-4-e2b-coreml", isDirectory: true),
-            Bundle.main.bundleURL.appendingPathComponent("gemma-4-e2b-coreml", isDirectory: true),
-            URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("models/gemma-4-e2b-coreml", isDirectory: true),
-        ]
-        if let docsModels {
-            candidates.insert(docsModels, at: 1)
-        }
-        for dir in candidates {
-            let cfg = dir.appendingPathComponent("model_config.json")
-            let c1 = dir.appendingPathComponent("chunk_1.mlmodelc")
-            if FileManager.default.fileExists(atPath: cfg.path) && FileManager.default.fileExists(atPath: c1.path) {
-                return dir
-            }
-        }
-        return nil
-    }
-
     public var coreModelsReady: Bool {
         sileroURL != nil && senseVoiceModelURL != nil && senseVoiceTokensURL != nil && gemma4GGUFURL != nil
     }
@@ -126,7 +102,6 @@ public final class ModelManager: NSObject, ObservableObject, URLSessionDownloadD
         if sileroURL != nil { found.insert(.sileroVAD) }
         if senseVoiceModelURL != nil && senseVoiceTokensURL != nil { found.insert(.senseVoiceInt8) }
         if gemma4GGUFURL != nil { found.insert(.gemma4GGUFQ4) }
-        if gemma4CoreMLDirectory != nil { found.insert(.gemma4CoreMLANE) }
         if gemma4DrafterDirectory != nil { found.insert(.gemma4MTPDrafter) }
         installed = found
     }
@@ -184,7 +159,6 @@ public final class ModelManager: NSObject, ObservableObject, URLSessionDownloadD
             case .sileroVAD: try await downloadSileroVAD()
             case .senseVoiceInt8: try await downloadSenseVoiceInt8()
             case .gemma4GGUFQ4: try await downloadGemma4Q4_0()
-            case .gemma4CoreMLANE: try await downloadGemma4CoreMLANE()
             case .gemma4MTPDrafter: try await downloadGemma4Drafter()
             }
             scanInstalledModels()
@@ -263,38 +237,6 @@ public final class ModelManager: NSObject, ObservableObject, URLSessionDownloadD
                 upstreamURL: "https://huggingface.co/google/gemma-4-E2B-it-assistant/resolve/main/\(name)"
             )
             try await fetchFile(from: src, to: dir.appendingPathComponent(name), updateProgress: progress)
-        }
-    }
-
-    private func downloadGemma4CoreMLANE() async throws {
-        activeDownload = .gemma4CoreMLANE
-        downloadProgress = 0
-        statusMessage = "下載 Gemma 4 E2B Stateful CoreML (ANE NPU)…"
-
-        let apiURL = URL(string: "https://huggingface.co/api/models/mlboydaisuke/gemma-4-E2B-stateful-coreml/tree/main?recursive=true")!
-        let (data, _) = try await session.data(from: apiURL)
-        struct HFEntry: Decodable { let type: String; let path: String; let size: Int64? }
-        let entries = try JSONDecoder().decode([HFEntry].self, from: data)
-        let files = entries.filter { $0.type == "file" && !$0.path.hasPrefix(".") && $0.path != "README.md" }
-        let totalBytes = max(1, files.reduce(Int64(0)) { $0 + ($1.size ?? 0) })
-        var completedBytes: Int64 = 0
-
-        let targetDir = rootDirectory.appendingPathComponent("gemma-4-e2b-coreml", isDirectory: true)
-        for entry in files {
-            let fileDest = targetDir.appendingPathComponent(entry.path)
-            if FileManager.default.fileExists(atPath: fileDest.path) {
-                completedBytes += entry.size ?? 0
-                downloadProgress = Double(completedBytes) / Double(totalBytes)
-                continue
-            }
-            statusMessage = "下載 ANE: \(entry.path)…"
-            let fileURL = resolvedURL(
-                relativePath: "gemma-4-e2b-coreml/\(entry.path)",
-                upstreamURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-stateful-coreml/resolve/main/\(entry.path)"
-            )
-            try await fetchFile(from: fileURL, to: fileDest, updateProgress: false)
-            completedBytes += entry.size ?? 0
-            downloadProgress = Double(completedBytes) / Double(totalBytes)
         }
     }
 

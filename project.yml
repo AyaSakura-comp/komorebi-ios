@@ -13,7 +13,7 @@ packages:
     exactVersion: 2.0.1
   SwiftyOpenCC:
     url: https://github.com/ddddxxx/SwiftyOpenCC
-    from: 1.0.1
+    exactVersion: 1.0.1
 
 settings:
   base:

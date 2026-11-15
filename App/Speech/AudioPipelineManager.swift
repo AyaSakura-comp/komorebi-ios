@@ -20,7 +20,7 @@ public enum DictationMode: String, CaseIterable, Codable, Sendable {
 
 /// Manages 16 kHz microphone capture (with background audio survival for Keyboard Extension),
 /// CPU Silero VAD + SenseVoice-Small + OpenCC streaming partial/final transcription,
-/// Gemma 4 E2B Metal / ANE / CPU text refinement, and bidirectional App Group IPC.
+/// Gemma 4 E2B text refinement on the Apple Neural Engine (direct MIL engine), and bidirectional App Group IPC.
 @MainActor
 public final class AudioPipelineManager: ObservableObject {
     @Published public private(set) var phase: DictationPhase = .idle
@@ -31,7 +31,6 @@ public final class AudioPipelineManager: ObservableObject {
 
     // Editor states (also synced with Keyboard Extension over App Group IPC)
     @Published public var mode: DictationMode = .draft
-    @Published public var backendPreference: InferenceBackendPreference = .auto
     @Published public var noiseSuppressionEnabled: Bool {
         didSet {
             UserDefaults.standard.set(noiseSuppressionEnabled, forKey: Self.noiseSuppressionDefaultsKey)
@@ -161,11 +160,13 @@ public final class AudioPipelineManager: ObservableObject {
             self.vad = vadInstance
             self.asr = asrInstance
 
-            // Metal is not loaded by default: the GPU heats the phone. The direct-ANE engine is the default backend
-            // in both foreground and background (first launch re-quantises weights for the ANE and caches them).
-            try await refiner.loadGGUF(url: ggufURL, preferMetal: false, maxContext: 1024)
+            // Gemma 4 E2B runs only on the Apple Neural Engine (direct MIL engine). The first launch re-quantises the
+            // weights for the ANE and compiles the programs (about a minute); later launches load them from the cache.
+            try await refiner.loadGGUF(url: ggufURL)
             var aneFailure: String?
-            if !isRunningInSimulator {
+            if isRunningInSimulator {
+                aneFailure = "模擬器沒有 Neural Engine"
+            } else {
                 let cacheDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
                     .appendingPathComponent("komorebi-ane", isDirectory: true)
                 do {
@@ -175,24 +176,13 @@ public final class AudioPipelineManager: ObservableObject {
                     aneFailure = error.localizedDescription
                 }
             }
-            if await refiner.aneDirect == nil {
-                if #available(iOS 18.0, *), !isRunningInSimulator, let aneDir = modelManager.gemma4CoreMLDirectory {
-                    try? await refiner.loadANECoreML(directory: aneDir)
-                }
-                if await !refiner.isANEAvailable { await refiner.ensureMetalLoaded() }
-            }
 
-            isEngineLoaded = await refiner.isLoaded
-            let hasMetal = await refiner.metalEngine != nil
-            let hasANE = await refiner.isANEAvailable
+            // Listening only needs VAD + ASR; without the ANE engine sentences are inserted as recognised.
+            isEngineLoaded = true
             if let desc = await refiner.aneDirectDescription {
                 statusBanner = "就緒：\(desc)"
-            } else if hasANE {
-                statusBanner = "就緒：CoreML ANE" + (aneFailure.map { "（ANE 直跑失敗：\($0)）" } ?? "")
-            } else if hasMetal {
-                statusBanner = "就緒：Metal GPU / 背景 CPU" + (aneFailure.map { "（ANE 失敗：\($0)）" } ?? "")
             } else {
-                statusBanner = "就緒：CPU Q4_0"
+                statusBanner = "就緒：僅語音辨識（Gemma 未載入：\(aneFailure ?? "未知原因")）"
             }
         } catch {
             phase = .error
@@ -412,15 +402,12 @@ public final class AudioPipelineManager: ObservableObject {
         guard !spokenInstruction.isEmpty else { return }
         phase = .refining
         statusBanner = "Gemma 4 正在改寫圈選文字…"
-        let isBG = UIApplication.shared.applicationState == .background
         do {
             let res = try await refiner.selectionEdit(
                 before: before,
                 selected: selected,
                 after: after,
-                raw: spokenInstruction,
-                inBackground: isBG,
-                preference: backendPreference
+                raw: spokenInstruction
             )
             historyStack.append(editorText)
             editorText = before + res.text + after
@@ -554,18 +541,12 @@ public final class AudioPipelineManager: ObservableObject {
             statusBanner = "Gemma 4 E2B 整理文字中…"
             publishIPCState(committedText: nil, isDraftReplacement: false)
 
-            let isBG = UIApplication.shared.applicationState == .background
             do {
                 if mode == .draft {
                     applyKeyboardDraftEdit()
                     let prev = editorText
                     let version = draftEditVersion
-                    let res = try await refiner.draftMerge(
-                        draft: prev,
-                        raw: raw,
-                        inBackground: isBG,
-                        preference: backendPreference
-                    )
+                    let res = try await refiner.draftMerge(draft: prev, raw: raw)
                     applyKeyboardDraftEdit()
                     var updated = res.text
                     if draftEditVersion != version || editorText != prev {
@@ -584,12 +565,7 @@ public final class AudioPipelineManager: ObservableObject {
                     recentDraftCommits.append((commitID, raw))
                     if recentDraftCommits.count > 16 { recentDraftCommits.removeFirst(recentDraftCommits.count - 16) }
                 } else {
-                    let res = try await refiner.refineSentence(
-                        raw: raw,
-                        context: lastContextTail,
-                        inBackground: isBG,
-                        preference: backendPreference
-                    )
+                    let res = try await refiner.refineSentence(raw: raw, context: lastContextTail)
                     let prev = editorText
                     historyStack.append(prev)
                     let appended = prev.isEmpty ? res.text : res.text
@@ -776,8 +752,7 @@ public final class AudioPipelineManager: ObservableObject {
         guard isEngineLoaded else { return }
         phase = .refining
         publishIPCState(committedText: nil, isDraftReplacement: false)
-        let isBG = UIApplication.shared.applicationState == .background
-        if let res = try? await refiner.refineSentence(raw: raw, inBackground: isBG, preference: backendPreference) {
+        if let res = try? await refiner.refineSentence(raw: raw) {
             updateTelemetry(res.stats)
             publishIPCState(committedText: res.text, isDraftReplacement: false)
         }

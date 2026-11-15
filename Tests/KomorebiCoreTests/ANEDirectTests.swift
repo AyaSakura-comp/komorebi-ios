@@ -2,7 +2,7 @@ import XCTest
 @testable import KomorebiCore
 import KomorebiANEDirect
 
-/// Direct-ANE (private MIL compiler) Gemma 4 E2B engine: correctness vs. the Metal engine, speed, profile.
+/// Direct-ANE (private MIL compiler) Gemma 4 E2B engine: output, speed and per-program profile.
 /// Env: ANE_BITS (LUT bits, default 4), ANE_GROUP (rows per LUT, default 8), ANE_CHUNK (prefill S, default 64).
 final class ANEDirectTests: XCTestCase {
     private let ggufPath = URL(fileURLWithPath: NSHomeDirectory())

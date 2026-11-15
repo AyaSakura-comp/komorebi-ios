@@ -23,7 +23,7 @@ final class KomorebiAppTests: XCTestCase {
             isDraftReplacement: true,
             noiseSuppressionActive: true,
             micIsolationLabel: "語音隔離 (AI)",
-            telemetry: KomorebiTelemetry(backendUsed: "Metal Q4_0", prefillTokens: 150, prefillTPS: 83.9, decodeTokens: 12, decodeTPS: 49.0, asrLatencyMs: 65)
+            telemetry: KomorebiTelemetry(backendUsed: "ANE direct (LUT4, MTP×3)", prefillTokens: 150, prefillTPS: 83.9, decodeTokens: 12, decodeTPS: 49.0, asrLatencyMs: 65)
         )
         store.writeState(state)
         let decoded = store.readState()

@@ -34,14 +34,8 @@ let package = Package(
             name: "KomorebiCore",
             dependencies: ["KomorebiIPC", "KomorebiANEDirect"],
             path: "Sources/KomorebiCore",
-            resources: [
-                .process("Gemma4Shaders.metal")
-            ],
             linkerSettings: [
-                .linkedFramework("Metal"),
-                .linkedFramework("MetalPerformanceShaders"),
                 .linkedFramework("Accelerate"),
-                .linkedFramework("CoreML"),
             ]
         ),
         .testTarget(
