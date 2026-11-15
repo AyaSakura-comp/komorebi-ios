@@ -48,7 +48,12 @@ Mac mini M4 上一句要多久：同一批句子，都指定中文、暖機後�
 * 時間幾乎都花在解碼（暖機後約 30–36 tok/s），編碼器 11–22 ms、prefill 40–110 ms。解碼時 embedding 和重新評分用的列直接從 GGUF 讀，第一次碰到的分頁要從磁碟載入；GGUF 放在外接 exFAT 碟上時，第一輪只有 16–19 tok/s。
 * 重跑方式：`Qwen3ASRTests/testInterleavedWithMLX`（每句輪流）、`testBakeoffSet` 加 `QWEN3_ASR_CONCAT=1,2,4`，以及 [`Tools/qwen3-asr/latency_mlx.py`](Tools/qwen3-asr/latency_mlx.py)，見 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) 第 10 節。
 
-* iPhone 14 Pro Max（A16）：每句約 0.4–0.75 秒（編碼器約 20 ms、prefill 70–110 ms、解碼 14–18 tok/s），App 記憶體從 510 MB 變成約 600 MB。第一次載入要在手機上編譯 35 個 ANE 程式（約 90 秒，期間整句先用 SenseVoice），之後從系統快取載入。
+* iPhone 14 Pro Max（A16），Release 版，用測試集前 30 句（1.6–4.5 秒）：
+  * 速度：每句平均 0.39 秒（p90 0.52 秒、最長 0.56 秒，RTF 0.15），編碼器 15 ms、prefill 45–85 ms、解碼約 26 tok/s。
+  * 正確率：MER 5.2 %，SenseVoice 是 13.9 %。辨識出來的文字跟 Mac 上同一個引擎 30 句全部相同。
+  * 實際說話流程（`--preview-selftest`）：Gemma 同時在 ANE 上整理草稿，所以解碼降到 18–19 tok/s。7.7 秒的句子要 1.6 秒，2.4 秒的句子要 0.53 秒。
+  * 記憶體：App 從 500 MB 變成約 570–600 MB。
+  * 第一次載入：每次重新安裝後第一次開啟，都要在手機上重新編譯 35 個 ANE 程式（約 90 秒，期間整句先用 SenseVoice；Gemma 的程式也要重編，就緒從 2.7 秒變成 14 秒）。之後從系統快取載入，Qwen3-ASR 約 4 秒就緒。
 * 解碼器用 4-bit 查表會完全壞掉（MER > 100 %，一直重複同一個字），6-bit 是下限。
 * 位址空間：免費 Apple ID 不能開 Extended Virtual Addressing，App 只有幾 GB 的位址空間。兩個模型的檔案和 ANE 權重全部 map 進來（約 8 GB）會配置失敗，所以 ANE 程式載入後就放掉權重 blob，Qwen3 的 GGUF 只 map 檔頭和 embedding 表，程式一次載入三個。
 * 指定語言為中文（跟桌面版 Komorebi 對 TEA 的做法一樣）和讓模型自己判斷的 MER 相同，英文句子照樣輸出英文，每句少解碼 3 個 token。詳細量測與 ANE 編譯器的實測限制見 [`Tools/ane-direct/README.md`](Tools/ane-direct/README.md)。
