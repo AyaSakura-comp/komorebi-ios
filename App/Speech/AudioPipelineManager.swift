@@ -794,7 +794,7 @@ public final class AudioPipelineManager: ObservableObject {
                     editorText = prev + appended
                     preeditText = ""
                     freshRange = NSRange(location: prev.count, length: appended.count)
-                    lastContextTail = String(editorText.suffix(120))
+                    lastContextTail = String(editorText.suffix(KomorebiPrompts.refineContextChars))
                     updateTelemetry(res.stats)
                     publishIPCState(committedText: appended, isDraftReplacement: false)
                 }

@@ -96,7 +96,7 @@ public actor KomorebiRefiner {
         }
 
         let turns = KomorebiPrompts.draftTurns(draft: trimmedDraft, raw: raw)
-        let maxToks = max(128, trimmedDraft.count + raw.count * 3 + 48)
+        let maxToks = min(2048, trimmedDraft.count + 2 * raw.count + 128)
         let first = try await generateChat(turns: turns, maxNewTokens: maxToks)
         let cleaned = KomorebiPrompts.cleanModelOutput(first.text)
 
@@ -122,7 +122,12 @@ public actor KomorebiRefiner {
     public func selectionEdit(before: String, selected: String, after: String, raw: String) async throws -> GenerationResult {
         let turns = KomorebiPrompts.selectionTurns(before: before, selected: selected, after: after, raw: raw)
         let res = try await generateChat(turns: turns, maxNewTokens: max(128, selected.count * 3 + raw.count * 2 + 48))
-        let text = KomorebiPrompts.parseSelectionJSON(res.text) ?? selected
+        // Komorebi: when the rewrite is unusable, the sentence replaces the selection as heard.
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let parsed = KomorebiPrompts.parseSelectionJSON(res.text),
+           KomorebiPrompts.acceptSelection(selected: selected, raw: raw, replacement: parsed) {
+            text = parsed.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         return GenerationResult(text: text, tokenIDs: res.tokenIDs, stats: res.stats)
     }
 

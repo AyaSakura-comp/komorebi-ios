@@ -9,7 +9,9 @@ final class KomorebiCoreTests: XCTestCase {
 
     func testPromptWrappersAndSanityFilters() {
         XCTAssertTrue(KomorebiPrompts.acceptRefined(raw: "呃我們明天三點開會", refined: "我們明天三點開會。"))
-        XCTAssertFalse(KomorebiPrompts.acceptRefined(raw: "明天開會", refined: "身為 AI 語言模型，我很樂意幫您整理。"))
+        XCTAssertFalse(KomorebiPrompts.acceptRefined(raw: "明天開會", refined: String(repeating: "這是一篇回答而不是整理後的句子。", count: 3)))
+        XCTAssertFalse(KomorebiPrompts.acceptDraftRetry(draft: "明天早上十點開會。", raw: "嗯", updated: "明天早上十點開會。"))
+        XCTAssertTrue(KomorebiPrompts.acceptSelection(selected: "香蕉、", raw: "刪掉", replacement: ""))
         XCTAssertEqual(KomorebiPrompts.parseSelectionJSON("```json\n{\"text\": \"太棒了吧！\"}\n```"), "太棒了吧！")
         XCTAssertEqual(KomorebiPrompts.parseSelectionJSON("{\"text\": \"\"}"), "")
         XCTAssertFalse(KomorebiPrompts.acceptDraftRetry(draft: "明天早上十點要在會議室開會報告季度成果", raw: "把報告刪掉", updated: "太短了"))
@@ -71,5 +73,11 @@ final class KomorebiCoreTests: XCTestCase {
         let merged = try await refiner.draftMerge(draft: res1.text, raw: "然後記得帶筆電")
         print("ANE DRAFT MERGE: '\(merged.text)' | decode \(String(format: "%.1f", merged.stats.decodeTPS)) tok/s")
         XCTAssertTrue(merged.text.count > res1.text.count)
+
+        let deleted = try await refiner.selectionEdit(before: "我買了蘋果、", selected: "香蕉、", after: "和葡萄。", raw: "刪掉")
+        let replaced = try await refiner.selectionEdit(before: "下午去", selected: "郵局", after: "寄包裹。", raw: "改成便利商店")
+        print("ANE SELECTION: 刪掉 -> '\(deleted.text)' | 改成便利商店 -> '\(replaced.text)'")
+        XCTAssertEqual(deleted.text, "")
+        XCTAssertTrue(replaced.text.contains("便利商店"))
     }
 }
