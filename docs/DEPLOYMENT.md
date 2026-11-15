@@ -283,6 +283,18 @@ QWEN3_ASR_GGUF=$M/qwen3-asr/qwen3-asr-1.7b-q8_0.gguf QWEN3_ASR_REF=$M/qwen3-asr-
   swift test -c release --filter Qwen3ASRTests
 ```
 
+跟 Metal GPU（MLX 8-bit）比每句耗時：同一句先後交給 ANE 和 MLX（每句輪流誰先跑），背景工作對兩邊的影響就會一樣。MLX 這邊用 asr-bakeoff 的 venv（裡面有 mlx_audio），先執行 `find .venv hf -name '._*' -delete`：
+
+```bash
+B=~/ExtDev/asr-bakeoff
+QWEN3_ASR_GGUF=$M/qwen3-asr/qwen3-asr-1.7b-q8_0.gguf QWEN3_ASR_MER=$B/data/cs/meta.json \
+QWEN3_ASR_LANGUAGE=Chinese QWEN3_ASR_CONCAT=1,2,4 QWEN3_ASR_OUT_DIR=/tmp \
+QWEN3_ASR_MLX_CMD="HF_HOME=$B/hf $B/.venv/bin/python $PWD/Tools/qwen3-asr/latency_mlx.py --serve --meta $B/data/cs/meta.json" \
+  swift test -c release --filter Qwen3ASRTests/testInterleavedWithMLX
+```
+
+`QWEN3_ASR_CONCAT=1,2,4` 會把 2 句、4 句接成約 5 秒、10 秒的長句再量一次。只量 ANE 用 `testBakeoffSet`（同一組環境變數，不用 `QWEN3_ASR_MLX_CMD`）；只量 MLX 用 `latency_mlx.py --out <json>`。
+
 App 會把麥克風工作階段的事件（開始、自動返回結果、待命、背景開始、被中斷）和每句整句辨識的結果（用哪個辨識器、耗時）寫進 App 的 `Documents/komorebi-diag.log`，可以這樣拿回 Mac：
 
 ```bash

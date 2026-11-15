@@ -163,7 +163,9 @@ final class Qwen3ASRTests: XCTestCase {
         print(line)
     }
 
-    /// Transcribes the bake-off set (QWEN3_ASR_MER=<meta.json>) and writes `<name>.json` with the hypotheses for scoring.
+    /// Transcribes the bake-off set (QWEN3_ASR_MER=<meta.json>) and writes `<name>.json` with the hypotheses for scoring
+    /// and each sentence's wall-clock time. QWEN3_ASR_CONCAT=1,2,4 also times longer sentences made of 2 and 4 clips joined
+    /// (the same comparison as Tools/qwen3-asr/latency_mlx.py on the Metal GPU).
     func testBakeoffSet() throws {
         let env = ProcessInfo.processInfo.environment
         guard let ggufURL, let metaPath = env["QWEN3_ASR_MER"] else { throw XCTSkip("QWEN3_ASR_GGUF / QWEN3_ASR_MER not set") }
@@ -178,25 +180,50 @@ final class Qwen3ASRTests: XCTestCase {
         let language = env["QWEN3_ASR_LANGUAGE"]
         let engine = try Qwen3ASRANEEngine(gguf: try GGUFFile(url: ggufURL, loadTokenizerArrays: true, mapTensorData: false), options: opts)
         try engine.warmUp()
-        var hyps: [String] = []
-        var audioSeconds = 0.0, busy = 0.0, decodeTok = 0, decodeSec = 0.0
-        for it in items {
-            let path = it.wav.hasPrefix("/") ? it.wav : root.appendingPathComponent(it.wav).path
-            let samples = try Self.readWAV(path)
-            let r = try engine.transcribe(samples, language: language)
-            hyps.append(r.text)
-            audioSeconds += Double(samples.count) / 16000
-            busy += r.totalSeconds
-            decodeTok += r.tokenIDs.count
-            decodeSec += r.decodeSeconds
+        let clips = try items.map { it -> [Float] in
+            try Self.readWAV(it.wav.hasPrefix("/") ? it.wav : root.appendingPathComponent(it.wav).path)
         }
         let name = env["QWEN3_ASR_OUT"] ?? "qwen3-1.7b-ane"
-        let out: [String: Any] = ["name": name, "backend": engine.backendName, "rtf": busy / audioSeconds,
-                                  "decode_tok_s": Double(decodeTok) / max(decodeSec, 1e-9), "hyps": hyps]
+        var out: [String: Any] = ["name": name, "backend": engine.backendName, "language": language ?? "auto"]
+        var latency: [[String: Any]] = []
+        for n in (env["QWEN3_ASR_CONCAT"] ?? "1").split(separator: ",").compactMap({ Int($0) }) where n >= 1 {
+            var hyps: [String] = [], utts: [[String: Any]] = [], walls: [Double] = []
+            var audioSeconds = 0.0, busy = 0.0, decodeTok = 0, decodeSec = 0.0
+            let start = Date()
+            for g in stride(from: 0, to: clips.count - n + 1, by: n) {
+                let samples = Array(clips[g..<(g + n)].joined())
+                let t0 = CFAbsoluteTimeGetCurrent()
+                let r = try engine.transcribe(samples, language: language)
+                let wall = CFAbsoluteTimeGetCurrent() - t0
+                let dur = Double(samples.count) / 16000
+                hyps.append(r.text)
+                walls.append(wall)
+                audioSeconds += dur
+                busy += r.totalSeconds
+                decodeTok += r.tokenIDs.count
+                decodeSec += r.decodeSeconds
+                utts.append(["dur": dur, "wall": wall, "mel": r.melSeconds, "encoder": r.encoderSeconds,
+                             "prefill": r.prefillSeconds, "decode": r.decodeSeconds, "tokens": r.tokenIDs.count,
+                             "audio_tokens": r.audioTokens, "text": r.text])
+            }
+            let end = Date()
+            if n == 1 {
+                out["rtf"] = busy / audioSeconds
+                out["decode_tok_s"] = Double(decodeTok) / max(decodeSec, 1e-9)
+                out["hyps"] = hyps
+            }
+            latency.append(["concat": n, "start": start.timeIntervalSince1970, "end": end.timeIntervalSince1970, "utts": utts])
+            let sorted = walls.sorted()
+            print(String(format: "%@ x%d: %d sentences of %.2f s, wall mean %.0f ms, p50 %.0f, p90 %.0f, max %.0f, RTF %.3f, decode %.1f tok/s",
+                         engine.backendName, n, walls.count, audioSeconds / Double(walls.count),
+                         walls.reduce(0, +) / Double(walls.count) * 1000, sorted[sorted.count / 2] * 1000,
+                         sorted[Int(Double(sorted.count - 1) * 0.9)] * 1000, sorted.last! * 1000,
+                         walls.reduce(0, +) / audioSeconds, Double(decodeTok) / max(decodeSec, 1e-9)))
+        }
+        out["latency"] = latency
         let outURL = URL(fileURLWithPath: env["QWEN3_ASR_OUT_DIR"] ?? NSTemporaryDirectory()).appendingPathComponent("\(name).json")
         try JSONSerialization.data(withJSONObject: out, options: [.prettyPrinted]).write(to: outURL)
-        print(String(format: "%@: RTF %.3f, decode %.1f tok/s -> %@", engine.backendName, busy / audioSeconds,
-                     Double(decodeTok) / max(decodeSec, 1e-9), outURL.path))
+        print("-> \(outURL.path)")
     }
 }
 
@@ -250,6 +277,109 @@ extension Qwen3ASRTests {
             let a = try engine.transcribe(samples)
             let z = try engine.transcribe(samples, language: "Chinese")
             print("\((path as NSString).lastPathComponent): auto [\(a.language ?? "-")] \(a.text) | Chinese: \(z.text)\n    \(a.summary)")
+        }
+    }
+}
+
+extension Qwen3ASRTests {
+    /// The bake-off sentences on the ANE and on the Metal GPU (MLX, `Tools/qwen3-asr/latency_mlx.py --serve`), back to
+    /// back for every sentence (alternating which goes first) so that whatever else the Mac is doing slows both alike.
+    /// QWEN3_ASR_MLX_CMD="HF_HOME=<bake-off>/hf <bake-off>/.venv/bin/python Tools/qwen3-asr/latency_mlx.py --serve --meta <meta.json>"
+    /// plus QWEN3_ASR_GGUF, QWEN3_ASR_MER, QWEN3_ASR_CONCAT=1,2,4 and QWEN3_ASR_LANGUAGE as for testBakeoffSet.
+    func testInterleavedWithMLX() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let ggufURL, let metaPath = env["QWEN3_ASR_MER"], let command = env["QWEN3_ASR_MLX_CMD"] else {
+            throw XCTSkip("QWEN3_ASR_GGUF / QWEN3_ASR_MER / QWEN3_ASR_MLX_CMD not set")
+        }
+        struct Item: Decodable { let wav: String }
+        let metaURL = URL(fileURLWithPath: metaPath)
+        let root = metaURL.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let clips = try JSONDecoder().decode([Item].self, from: Data(contentsOf: metaURL)).map {
+            try Self.readWAV($0.wav.hasPrefix("/") ? $0.wav : root.appendingPathComponent($0.wav).path)
+        }
+        let language = env["QWEN3_ASR_LANGUAGE"]
+        let engine = try Qwen3ASRANEEngine(gguf: try GGUFFile(url: ggufURL, loadTokenizerArrays: true, mapTensorData: false),
+                                           options: .init(cacheDirectory: cacheDir))
+        try engine.warmUp()
+        // One untimed pass: the decoder reads embedding and rescoring rows straight from the GGUF, and the first touch
+        // of each page comes from disk (slow on the exFAT drive); the app has them cached after its first sentences.
+        for c in clips { _ = try engine.transcribe(c, language: language) }
+
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: "/bin/sh")
+        child.arguments = ["-c", command]
+        let toChild = Pipe(), fromChild = Pipe()
+        child.standardInput = toChild
+        child.standardOutput = fromChild
+        try child.run()
+        defer { child.terminate() }
+        let reader = LineReader(fromChild.fileHandleForReading)
+        while let line = reader.next(), line != "READY" {}
+
+        func mlx(_ start: Int, _ count: Int) throws -> (wall: Double, tokens: Int, text: String) {
+            toChild.fileHandleForWriting.write(Data("\(start) \(count)\n".utf8))
+            while let line = reader.next() {
+                guard line.hasPrefix("RESULT "),
+                      let o = try JSONSerialization.jsonObject(with: Data(line.dropFirst(7).utf8)) as? [String: Any] else { continue }
+                return ((o["wall"] as? Double) ?? 0, (o["tokens"] as? Int) ?? 0, (o["text"] as? String) ?? "")
+            }
+            throw NSError(domain: "mlx", code: 1, userInfo: [NSLocalizedDescriptionKey: "MLX server exited"])
+        }
+
+        var runs: [[String: Any]] = []
+        for n in (env["QWEN3_ASR_CONCAT"] ?? "1").split(separator: ",").compactMap({ Int($0) }) where n >= 1 {
+            var utts: [[String: Any]] = [], aneWalls: [Double] = [], mlxWalls: [Double] = [], audio = 0.0
+            for (k, g) in stride(from: 0, to: clips.count - n + 1, by: n).enumerated() {
+                let samples = Array(clips[g..<(g + n)].joined())
+                func ane() throws -> (Double, Qwen3ASRResult) {
+                    let t0 = CFAbsoluteTimeGetCurrent()
+                    let r = try engine.transcribe(samples, language: language)
+                    return (CFAbsoluteTimeGetCurrent() - t0, r)
+                }
+                let a: (Double, Qwen3ASRResult), m: (wall: Double, tokens: Int, text: String)
+                if k % 2 == 0 { a = try ane(); m = try mlx(g, n) } else { m = try mlx(g, n); a = try ane() }
+                let dur = Double(samples.count) / 16000
+                audio += dur
+                aneWalls.append(a.0)
+                mlxWalls.append(m.wall)
+                utts.append(["dur": dur, "ane_wall": a.0, "ane_tokens": a.1.tokenIDs.count, "ane_encoder": a.1.encoderSeconds,
+                             "ane_prefill": a.1.prefillSeconds, "ane_decode": a.1.decodeSeconds, "ane_text": a.1.text,
+                             "mlx_wall": m.wall, "mlx_tokens": m.tokens, "mlx_text": m.text])
+            }
+            runs.append(["concat": n, "utts": utts])
+            func line(_ name: String, _ w: [Double]) -> String {
+                let s = w.sorted()
+                return String(format: "%@ mean %.0f ms, p50 %.0f, p90 %.0f, max %.0f, RTF %.3f", name,
+                              w.reduce(0, +) / Double(w.count) * 1000, s[s.count / 2] * 1000,
+                              s[Int(Double(s.count - 1) * 0.9)] * 1000, s.last! * 1000, w.reduce(0, +) / audio)
+            }
+            let ratios = zip(mlxWalls, aneWalls).map { $0 / $1 }.sorted()
+            print(String(format: "x%d (%d sentences of %.2f s): ", n, aneWalls.count, audio / Double(aneWalls.count)) +
+                  line("ANE", aneWalls) + " | " + line("MLX GPU", mlxWalls) +
+                  String(format: " | MLX/ANE per sentence: median %.2f", ratios[ratios.count / 2]))
+        }
+        let name = env["QWEN3_ASR_OUT"] ?? "qwen3-1.7b-ane-vs-mlx"
+        let outURL = URL(fileURLWithPath: env["QWEN3_ASR_OUT_DIR"] ?? NSTemporaryDirectory()).appendingPathComponent("\(name).json")
+        try JSONSerialization.data(withJSONObject: ["backend": engine.backendName, "runs": runs], options: [.prettyPrinted]).write(to: outURL)
+        print("-> \(outURL.path)")
+    }
+
+    /// Lines from a pipe (FileHandle has no line reader).
+    private final class LineReader {
+        private let handle: FileHandle
+        private var buffer = Data()
+        init(_ handle: FileHandle) { self.handle = handle }
+        func next() -> String? {
+            while true {
+                if let i = buffer.firstIndex(of: 0x0A) {
+                    let line = String(decoding: buffer[buffer.startIndex..<i], as: UTF8.self)
+                    buffer.removeSubrange(buffer.startIndex...i)
+                    return line
+                }
+                let chunk = handle.availableData
+                if chunk.isEmpty { return nil }
+                buffer.append(chunk)
+            }
         }
     }
 }

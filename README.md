@@ -32,9 +32,21 @@ Mac（M4）上同一個引擎：一般解碼 40.6 tok/s、prefill 3090 tok/s，M
 | 辨識器 | MER | 英文 WER | 速度 |
 |---|---|---|---|
 | SenseVoice-Small int8（即時字幕） | 15.97 % | 57.9 % | 每次約 50 ms（CPU） |
-| Qwen3-ASR-1.7B，MLX 8-bit（Mac GPU，參考） | 8.50 % | 20.3 % | RTF 0.27（M4） |
+| Qwen3-ASR-1.7B，MLX 8-bit（Mac GPU，參考） | 8.50 % | 20.3 % | RTF 0.15（M4 GPU，指定中文；見下表） |
 | **Qwen3-ASR-1.7B，本 repo 的 ANE 引擎**（解碼器 LUT6、編碼器 LUT8，預設） | **8.84 %** | **20.7 %** | RTF 0.12（M4）：編碼器 12 ms、prefill 35–85 ms、解碼約 34 tok/s |
 | 同上，解碼器 LUT8 | 8.36 % | 21.1 % | RTF 0.15（M4）、解碼約 27 tok/s，ANE 權重多 0.35 GB |
+
+Mac mini M4 上一句要多久：同一批句子，都指定中文、暖機後量。範圍是兩種量法的結果：先整批跑完一邊再跑另一邊，以及每句在 ANE 和 GPU 上輪流各跑一次（排除被背景工作卡住的句子）：
+
+| 句長 | ANE（本 repo，預設 LUT6） | Metal GPU（MLX 8-bit） | GPU／ANE |
+|---|---|---|---|
+| 2.5 秒（約 8 個 token） | **0.29–0.31 秒** | 0.38–0.43 秒 | 1.34–1.37 倍 |
+| 5 秒（約 17 個 token） | **0.61–0.64 秒** | 0.72–0.80 秒 | 1.13–1.31 倍 |
+| 10 秒（約 33 個 token） | **1.2–1.4 秒** | 1.5–1.6 秒 | 1.09–1.23 倍 |
+
+* 功耗（powermetrics，轉寫時比待機多出來的部分）：MLX 跑時 GPU 多 8–10 W，每句多耗 3.4 J（2.5 秒）到 12.7 J（10 秒）；ANE 引擎只多 0.2–1.5 W（ANE）。兩邊 CPU 的差異都在背景負載的波動範圍內，量不出來。
+* 時間幾乎都花在解碼（暖機後約 30–36 tok/s），編碼器 11–22 ms、prefill 40–110 ms。解碼時 embedding 和重新評分用的列直接從 GGUF 讀，第一次碰到的分頁要從磁碟載入；GGUF 放在外接 exFAT 碟上時，第一輪只有 16–19 tok/s。
+* 重跑方式：`Qwen3ASRTests/testInterleavedWithMLX`（每句輪流）、`testBakeoffSet` 加 `QWEN3_ASR_CONCAT=1,2,4`，以及 [`Tools/qwen3-asr/latency_mlx.py`](Tools/qwen3-asr/latency_mlx.py)，見 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) 第 10 節。
 
 * iPhone 14 Pro Max（A16）：每句約 0.4–0.75 秒（編碼器約 20 ms、prefill 70–110 ms、解碼 14–18 tok/s），App 記憶體從 510 MB 變成約 600 MB。第一次載入要在手機上編譯 35 個 ANE 程式（約 90 秒，期間整句先用 SenseVoice），之後從系統快取載入。
 * 解碼器用 4-bit 查表會完全壞掉（MER > 100 %，一直重複同一個字），6-bit 是下限。
