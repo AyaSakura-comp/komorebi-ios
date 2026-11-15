@@ -128,7 +128,7 @@ struct KeyboardView: View {
                         .font(.caption)
                         .foregroundStyle(KeyboardPalette.persimmon(scheme))
                         .lineLimit(2)
-                } else if !bridge.state.partialText.isEmpty {
+                } else if !bridge.state.partialText.isEmpty || !bridge.state.partialTail.isEmpty {
                     (Text(bridge.state.partialText)
                         .foregroundColor(KeyboardPalette.ink(scheme))
                      + Text(bridge.state.partialTail)
@@ -137,7 +137,7 @@ struct KeyboardView: View {
                         .lineLimit(2)
                         .truncationMode(.head)
                 } else if isListening {
-                    Text("直接說話，停頓後整理進上方輸入框（那就是草稿，⌫ 刪字會同步）。「斷句」＝不等停頓立刻整理")
+                    Text("邊說邊整理：整理好的字直接出現在輸入框（那就是草稿，⌫ 會同步），這裡淡色的是還沒整理的字")
                         .font(.caption)
                         .foregroundStyle(KeyboardPalette.muted(scheme))
                         .lineLimit(2)

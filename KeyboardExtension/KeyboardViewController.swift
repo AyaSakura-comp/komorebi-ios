@@ -166,7 +166,9 @@ final class KeyboardBridgeModel: ObservableObject {
             checkDraftIntegrity()
             return
         }
-        if next.isDraftReplacement, !lastInsertedDraft.isEmpty, let proxy = controller?.textDocumentProxy,
+        // Right after our own edits the proxy's context can lag (clean-ups arrive every ~0.5 s): trust our record then.
+        if next.isDraftReplacement, !lastInsertedDraft.isEmpty, Date().timeIntervalSince1970 >= quietUntil,
+           let proxy = controller?.textDocumentProxy,
            !Self.fieldEndsWith(before: proxy.documentContextBeforeInput ?? "", draft: lastInsertedDraft) {
             // The field changed since our last update (text deleted, message sent, cursor moved). Tell the host
             // first; it rebases this update on the field's text and publishes it again.
@@ -239,7 +241,7 @@ final class KeyboardBridgeModel: ObservableObject {
         }
 
         let before = proxy.documentContextBeforeInput ?? ""
-        if Self.fieldEndsWith(before: before, draft: lastInsertedDraft) {
+        if Date().timeIntervalSince1970 < quietUntil || Self.fieldEndsWith(before: before, draft: lastInsertedDraft) {
             let oldChars = Array(lastInsertedDraft)
             let newChars = Array(text)
             var prefixCount = 0

@@ -118,7 +118,14 @@ public final class AudioPipelineManager: ObservableObject {
     private let processingQueue = DispatchQueue(label: "dev.ayasakura.komorebi.audio-vad", qos: .userInitiated)
     private var partialTaskInFlight = false
     /// Finished sentences waiting for the draft merge, with the live preview shown for each when it finished.
-    private var refineQueue: [(pcm: [Float], preview: (raw: String, refined: String)?)] = []
+    private var refineQueue: [(pcm: [Float], preview: (raw: String, refined: String)?, serial: Int)] = []
+    /// Draft mode: the cleaned-up sentence being spoken, shown in the text field after the draft until its merge
+    /// replaces it.
+    private var provisional: (serial: Int, text: String)?
+    /// Sentences whose provisional text the user deleted or sent away (field cleared, 定稿): their merge is dropped.
+    private var droppedUtterances: Set<Int> = []
+    /// Words not yet cleaned up, for the keyboard's (dimmed) preview line when the clean-up goes to the field.
+    private var keyboardPreviewRaw = ""
     private var aneReady = false
     private var previewTask: Task<Void, Never>?
     private var lastPreviewRequest = ""
@@ -138,6 +145,10 @@ public final class AudioPipelineManager: ObservableObject {
 
     private var ipcSequence: UInt64 = 0
     private var ipcCommitID: UInt64 = 0
+    /// Every published state repeats the latest commit, so a reader that misses the commit's own publish (another
+    /// state was written right after it) still gets the same (commitID, text) pair, never an empty text.
+    private var lastCommitText = ""
+    private var lastCommitIsDraftReplacement = false
     private var lastHandledCommandID: UInt64 = 0
     private var pendingStartListeningOnForeground: Bool = false
     private var lastContextTail: String = ""
@@ -603,6 +614,10 @@ public final class AudioPipelineManager: ObservableObject {
     }
 
     public func resetDraft() {
+        if let p = provisional {
+            droppedUtterances.insert(p.serial)
+            provisional = nil
+        }
         historyStack.append(editorText)
         editorText = ""
         preeditText = ""
@@ -617,6 +632,17 @@ public final class AudioPipelineManager: ObservableObject {
     private func applyKeyboardDraftEdit() {
         guard let edit = KomorebiIPCStore.shared.readDraftEdit(), edit.id > lastDraftEditID else { return }
         lastDraftEditID = edit.id
+        if let p = provisional {
+            let committedIntact = edit.text.hasPrefix(editorText)
+            if committedIntact && edit.text.count > editorText.count {
+                // Only the sentence still being spoken was touched; its next clean-up or merge redraws it.
+                publishIPCState(committedText: nil, isDraftReplacement: false)
+                return
+            }
+            // That sentence was deleted, sent away with the field, or kept as typed text (定稿): drop its merge.
+            droppedUtterances.insert(p.serial)
+            provisional = nil
+        }
         var text = edit.text
         let missed = recentDraftCommits.filter { $0.commitID > edit.baseCommitID }
         for commit in missed { text = KomorebiPrompts.appendDraft(text, commit.raw) }
@@ -778,11 +804,32 @@ public final class AudioPipelineManager: ObservableObject {
 
     // MARK: - Live preview (clean-up while speaking)
 
+    /// Draft mode with live preview: each clean-up goes straight into the text field, after the draft.
+    private var previewInField: Bool { mode == .draft && livePreviewEnabled && aneReady }
+
+    /// The draft as the text field should show it: merged sentences plus the cleaned-up sentence being spoken.
+    private func displayedDraft() -> String {
+        guard let p = provisional else { return editorText }
+        return KomorebiPrompts.appendDraft(editorText, p.text)
+    }
+
+    @discardableResult
+    private func publishDraftDisplay() -> UInt64 {
+        publishIPCState(committedText: displayedDraft(), isDraftReplacement: true)
+    }
+
+    private func clearProvisional(for serial: Int) {
+        guard let p = provisional, p.serial == serial else { return }
+        provisional = nil
+        publishDraftDisplay()
+    }
+
     /// Shows the sentence being spoken: once it has a live clean-up, that stays on screen and only the words heard
     /// since (by length; SenseVoice re-transcribes the whole sentence, so earlier words can change) follow it dimmed.
     private func showPartial(_ raw: String) {
         latestPartialRaw = raw
         (preeditText, preeditTail) = Self.previewDisplay(raw: raw, preview: livePreview)
+        keyboardPreviewRaw = livePreview == nil ? raw : preeditTail
     }
 
     static func previewDisplay(raw: String, preview: (raw: String, refined: String)?) -> (main: String, tail: String) {
@@ -816,10 +863,16 @@ public final class AudioPipelineManager: ObservableObject {
             // No earlier text as context: for a very short sentence Gemma sometimes returned the context itself.
             let result = try? await self.refiner.previewSentence(raw: raw, context: "")
             self.previewTask = nil
-            guard let result, self.utteranceSerial == serial, self.isListening else { return }
+            guard let result, self.utteranceSerial == serial, self.isListening,
+                  !self.droppedUtterances.contains(serial) else { return }
             self.livePreview = (raw, result.text)
             self.showPartial(self.latestPartialRaw)
-            self.publishIPCState(committedText: nil, isDraftReplacement: false)
+            if self.previewInField {
+                self.provisional = (serial, result.text)
+                self.publishDraftDisplay()
+            } else {
+                self.publishIPCState(committedText: nil, isDraftReplacement: false)
+            }
             self.maybeStartPreview()  // the transcript may have grown meanwhile
         }
     }
@@ -834,8 +887,9 @@ public final class AudioPipelineManager: ObservableObject {
 
     private func enqueueFinalizedSegment(_ pcm: [Float]) {
         let preview = livePreview
+        let serial = utteranceSerial
         endLivePreview()
-        refineQueue.append((pcm, preview))
+        refineQueue.append((pcm, preview, serial))
         if !refineTaskRunning {
             Task { await drainRefineQueue() }
         }
@@ -849,6 +903,10 @@ public final class AudioPipelineManager: ObservableObject {
             let item = refineQueue.removeFirst()
             let pcm = item.pcm
             guard let asr else { continue }
+            if droppedUtterances.remove(item.serial) != nil {
+                clearProvisional(for: item.serial)
+                continue
+            }
 
             phase = .transcribing
             let transcript = await Task.detached(priority: .userInitiated) {
@@ -859,14 +917,18 @@ public final class AudioPipelineManager: ObservableObject {
             let raw = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !raw.isEmpty else {
                 preeditText = ""
+                keyboardPreviewRaw = ""
                 phase = isListening ? .listening : .idle
-                publishIPCState(committedText: nil, isDraftReplacement: false)
+                if provisional?.serial == item.serial { clearProvisional(for: item.serial) } else {
+                    publishIPCState(committedText: nil, isDraftReplacement: false)
+                }
                 continue
             }
 
             phase = .refining
             // While the sentence is merged, keep showing its cleaned-up preview.
             (preeditText, preeditTail) = Self.previewDisplay(raw: raw, preview: item.preview)
+            keyboardPreviewRaw = item.preview == nil ? raw : preeditTail
             statusBanner = "Gemma 4 E2B 整理文字中…"
             publishIPCState(committedText: nil, isDraftReplacement: false)
 
@@ -877,6 +939,15 @@ public final class AudioPipelineManager: ObservableObject {
                     let version = draftEditVersion
                     let res = try await refiner.draftMerge(draft: prev, raw: raw)
                     applyKeyboardDraftEdit()
+                    if droppedUtterances.remove(item.serial) != nil {
+                        // The user deleted or sent the sentence while it was being merged.
+                        clearProvisional(for: item.serial)
+                        preeditText = ""
+                        preeditTail = ""
+                        keyboardPreviewRaw = ""
+                        phase = isListening ? .listening : .idle
+                        continue
+                    }
                     var updated = res.text
                     if draftEditVersion != version || editorText != prev {
                         // The draft was edited while Gemma rewrote it (backspace in the field, 定稿, typing in the
@@ -887,11 +958,13 @@ public final class AudioPipelineManager: ObservableObject {
                     let current = editorText
                     historyStack.append(current)
                     editorText = updated
+                    if provisional?.serial == item.serial { provisional = nil }  // the merge replaces it in the field
                     preeditText = ""
                     preeditTail = ""
+                    keyboardPreviewRaw = ""
                     markFreshDelta(previous: current, updated: updated)
                     updateTelemetry(res.stats)
-                    let commitID = publishIPCState(committedText: updated, isDraftReplacement: true)
+                    let commitID = publishDraftDisplay()
                     recentDraftCommits.append((commitID, raw))
                     if recentDraftCommits.count > 16 { recentDraftCommits.removeFirst(recentDraftCommits.count - 16) }
                 } else {
@@ -911,10 +984,18 @@ public final class AudioPipelineManager: ObservableObject {
                 // Safe degraded fallback to SenseVoice + OpenCC raw text
                 let prev = editorText
                 historyStack.append(prev)
-                editorText = prev + raw
                 preeditText = ""
+                preeditTail = ""
+                keyboardPreviewRaw = ""
                 statusBanner = "整理降級為辨識原文：\(error.localizedDescription)"
-                publishIPCState(committedText: raw, isDraftReplacement: false)
+                if mode == .draft {
+                    editorText = KomorebiPrompts.appendDraft(prev, raw)
+                    if provisional?.serial == item.serial { provisional = nil }
+                    publishDraftDisplay()
+                } else {
+                    editorText = prev + raw
+                    publishIPCState(committedText: raw, isDraftReplacement: false)
+                }
             }
 
             phase = isListening ? .listening : .idle
@@ -975,8 +1056,10 @@ public final class AudioPipelineManager: ObservableObject {
     @discardableResult
     public func publishIPCState(committedText: String?, isDraftReplacement: Bool) -> UInt64 {
         ipcSequence &+= 1
-        if committedText != nil {
+        if let committedText {
             ipcCommitID &+= 1
+            lastCommitText = committedText
+            lastCommitIsDraftReplacement = isDraftReplacement
         }
         let state = KomorebiIPCState(
             sequence: ipcSequence,
@@ -987,10 +1070,10 @@ public final class AudioPipelineManager: ObservableObject {
             modelsReady: modelManager.coreModelsReady,
             phase: phase,
             micLevel: micLevel,
-            partialText: preeditText,
+            partialText: previewInField ? "" : preeditText,
             commitID: ipcCommitID,
-            committedText: committedText ?? "",
-            isDraftReplacement: isDraftReplacement,
+            committedText: lastCommitText,
+            isDraftReplacement: lastCommitIsDraftReplacement,
             noiseSuppressionActive: noiseSuppressionEnabled,
             micIsolationLabel: systemMicModeLabel,
             errorMessage: phase == .error ? statusBanner : nil,
@@ -1000,7 +1083,7 @@ public final class AudioPipelineManager: ObservableObject {
             micLive: audioEngine != nil,
             micStandbyUntil: micStandby ? micStandbyUntil : 0,
             enginesLoading: isLoadingModels,
-            partialTail: preeditText.isEmpty ? "" : preeditTail
+            partialTail: previewInField ? keyboardPreviewRaw : (preeditText.isEmpty ? "" : preeditTail)
         )
         KomorebiIPCStore.shared.writeState(state)
         return ipcCommitID

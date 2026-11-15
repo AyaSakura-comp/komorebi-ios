@@ -122,12 +122,30 @@ enum PreviewSelfTest {
             let text = tail.isEmpty ? main : "\(main)〔\(tail)〕"
             guard text != shown else { return }
             shown = text
-            if !main.isEmpty { log(String(format: "t=%.1fs preview: %@", CFAbsoluteTimeGetCurrent() - startTime, text)) }
+            _ = main
         }
         let draftObserver = pipeline.$editorText.sink { text in
-            if !text.isEmpty { log(String(format: "t=%.1fs DRAFT: %@", CFAbsoluteTimeGetCurrent() - startTime, text)) }
+            _ = text
         }
         startTime = CFAbsoluteTimeGetCurrent()
+        // What the keyboard sees: the text field (draft commits) and its preview line.
+        var lastCommit = KomorebiIPCStore.shared.readState().commitID
+        var lastLine = ""
+        let ipcWatch = Task { @MainActor in
+            while !Task.isCancelled {
+                let st = KomorebiIPCStore.shared.readState()
+                if st.commitID != lastCommit {
+                    lastCommit = st.commitID
+                    log(String(format: "t=%.1fs FIELD: %@", CFAbsoluteTimeGetCurrent() - startTime, st.committedText))
+                }
+                let line = st.partialText + (st.partialTail.isEmpty ? "" : "〔\(st.partialTail)〕")
+                if line != lastLine {
+                    lastLine = line
+                    if !line.isEmpty { log(String(format: "t=%.1fs   line: %@", CFAbsoluteTimeGetCurrent() - startTime, line)) }
+                }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
         let chunk = 1024
         var offset = 0
         while offset < samples.count {
@@ -141,6 +159,7 @@ enum PreviewSelfTest {
         while pipeline.isMergingSentence && Date() < deadline { try? await Task.sleep(nanoseconds: 100_000_000) }
         try? await Task.sleep(nanoseconds: 300_000_000)
         log("final draft: \(pipeline.editorText)")
+        ipcWatch.cancel()
         observer.cancel()
         draftObserver.cancel()
         log("DONE")
