@@ -67,7 +67,7 @@ grep -rl "dev.ayasakura" project.yml *.entitlements KeyboardExtension Sources Ap
 
    ```bash
    xcrun devicectl list devices
-   # AyaSakura-i14   00008120-XXXXXXXXXXXXXXXX (UDID)   connected   iPhone 14 Pro Max
+   # My-iPhone   00008120-XXXXXXXXXXXXXXXX (UDID)   connected   iPhone 14 Pro Max
    ```
 
    下面用 `UDID=` 代表這支手機的 UDID。

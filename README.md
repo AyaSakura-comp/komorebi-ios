@@ -126,4 +126,5 @@ open KomorebiVoice.xcodeproj   # 選 KomorebiVoice scheme 與你的 iPhone，Run
 
 * 直接呼叫 ANE 的做法參考 [maderix/ANE](https://github.com/maderix/ANE)（MIT）。
 * 模型各自適用其授權：Gemma（[Gemma Terms of Use](https://ai.google.dev/gemma/terms)）、SenseVoice（FunASR 模型授權）、Silero VAD（MIT）。
+* `App/Dictionary/` 的簡繁轉換字典來自 [OpenCC](https://github.com/BYVoid/OpenCC)（Apache-2.0）。
 * 提示詞與草稿流程移植自 Komorebi 語音輸入法的伺服器版（`app/realtime_service.py`）。
