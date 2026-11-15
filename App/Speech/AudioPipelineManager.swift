@@ -940,6 +940,7 @@ public final class AudioPipelineManager: ObservableObject {
                     let res = try await refiner.draftMerge(draft: prev, raw: raw)
                     applyKeyboardDraftEdit()
                     if droppedUtterances.remove(item.serial) != nil {
+                        diag("merge: dropped \"\(raw)\" (its text was deleted or sent from the field)")
                         // The user deleted or sent the sentence while it was being merged.
                         clearProvisional(for: item.serial)
                         preeditText = ""
@@ -965,6 +966,9 @@ public final class AudioPipelineManager: ObservableObject {
                     markFreshDelta(previous: current, updated: updated)
                     updateTelemetry(res.stats)
                     let commitID = publishDraftDisplay()
+                    let note = await refiner.lastMergeNote
+                    diag(String(format: "merge: %@ | draft %d chars + \"%@\" -> %d chars, %.1f tok/s%@", note, prev.count, raw,
+                                updated.count, res.stats.decodeTPS, updated == res.text ? "" : " (draft edited meanwhile: appended as heard)"))
                     recentDraftCommits.append((commitID, raw))
                     if recentDraftCommits.count > 16 { recentDraftCommits.removeFirst(recentDraftCommits.count - 16) }
                 } else {

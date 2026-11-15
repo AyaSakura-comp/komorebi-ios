@@ -11,6 +11,8 @@ public actor KomorebiRefiner {
     public private(set) var aneDirect: Gemma4ANEDirectEngine?
 
     private var cancelCounter: UInt64 = 0
+    /// How the last `draftMerge` ended (for the app's diagnostics log).
+    public private(set) var lastMergeNote = ""
 
     /// Live previews are cancelled from any thread (the actor is busy generating), so the flag lives outside it.
     private final class PreviewGate: @unchecked Sendable {
@@ -120,30 +122,44 @@ public actor KomorebiRefiner {
     public func draftMerge(draft: String, raw: String) async throws -> GenerationResult {
         let trimmedDraft = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmedDraft.isEmpty {
+            lastMergeNote = "first sentence (refine)"
             return try await refineSentence(raw: raw, context: "")
         }
 
         let turns = KomorebiPrompts.draftTurns(draft: trimmedDraft, raw: raw)
+        let heard = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let maxToks = min(2048, trimmedDraft.count + 2 * raw.count + 128)
         let first = try await generateChat(turns: turns, maxNewTokens: maxToks)
         let cleaned = KomorebiPrompts.cleanModelOutput(first.text)
 
-        // Retry with worked few-shot correction examples if model returned unchanged old draft (E2B parity).
-        if cleaned == trimmedDraft || cleaned.isEmpty {
+        // The old draft came back (Komorebi checks for an identical draft; E2B often also touches a comma, so
+        // punctuation and spaces are ignored here): what was just said was dropped. Ask once more, leaning on it.
+        let unchanged = cleaned.isEmpty || Self.words(cleaned) == Self.words(trimmedDraft)
+        if unchanged && !heard.isEmpty {
             let retryTurns = KomorebiPrompts.draftRetryTurns(draft: trimmedDraft, raw: raw)
             let retried = try await generateChat(turns: retryTurns, maxNewTokens: maxToks)
             let retryClean = KomorebiPrompts.cleanModelOutput(retried.text)
-            if !retryClean.isEmpty && KomorebiPrompts.acceptDraftRetry(draft: trimmedDraft, raw: raw, updated: retryClean) {
+            if KomorebiPrompts.acceptDraftRetry(draft: trimmedDraft, raw: raw, updated: retryClean) {
+                lastMergeNote = "unchanged; retry accepted"
                 return GenerationResult(text: retryClean, tokenIDs: retried.tokenIDs, stats: retried.stats)
             }
+            // Still nothing usable: keep the sentence as heard rather than lose it.
+            lastMergeNote = "unchanged; retry rejected (\(retryClean.prefix(40))); appended as heard"
+            return GenerationResult(text: KomorebiPrompts.appendDraft(trimmedDraft, heard), tokenIDs: retried.tokenIDs, stats: retried.stats)
         }
 
-        if KomorebiPrompts.acceptDraft(draft: trimmedDraft, raw: raw, updated: cleaned) && !cleaned.isEmpty {
+        if KomorebiPrompts.acceptDraft(draft: trimmedDraft, raw: raw, updated: cleaned) {
+            lastMergeNote = "rewritten"
             return GenerationResult(text: cleaned, tokenIDs: first.tokenIDs, stats: first.stats)
         }
         // Rejected rewrite: keep the sentence, appended as heard (the reference service does the same).
-        return GenerationResult(text: KomorebiPrompts.appendDraft(trimmedDraft, raw.trimmingCharacters(in: .whitespacesAndNewlines)),
-                                tokenIDs: first.tokenIDs, stats: first.stats)
+        lastMergeNote = "rewrite rejected (\(cleaned.prefix(40))); appended as heard"
+        return GenerationResult(text: KomorebiPrompts.appendDraft(trimmedDraft, heard), tokenIDs: first.tokenIDs, stats: first.stats)
+    }
+
+    /// Text without punctuation and spaces, to tell a real edit from a re-punctuated copy.
+    static func words(_ s: String) -> String {
+        String(s.unicodeScalars.filter { !CharacterSet.punctuationCharacters.contains($0) && !CharacterSet.whitespacesAndNewlines.contains($0) && !CharacterSet.symbols.contains($0) }.map(Character.init))
     }
 
     /// Lasso selection rewrite (`selection_edit`): replaces/deletes/rewrites `selected` based on spoken instruction.
