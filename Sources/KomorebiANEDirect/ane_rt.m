@@ -253,6 +253,14 @@ static IOSurfaceRef make_surface(size_t bytes, void **ptr) {
 
 - (BOOL)loadedFromCache { return _wasCached; }
 
+- (void)releaseWeights {
+    if (!_model) return;
+    Ivar descIvar = class_getInstanceVariable(object_getClass(_model), "_descriptor");
+    id desc = descIvar ? object_getIvar(_model, descIvar) : nil;
+    Ivar wIvar = desc ? class_getInstanceVariable(object_getClass(desc), "_weights") : NULL;
+    if (wIvar) object_setIvar(desc, wIvar, @{});
+}
+
 - (BOOL)eval:(int)pi error:(NSError **)error {
     NSError *e = nil;
     BOOL ok = ((BOOL(*)(id, SEL, unsigned int, id, id, NSError **))objc_msgSend)(_model, @selector(evaluateWithQoS:options:request:error:), 21, @{}, _procs[pi].request, &e);

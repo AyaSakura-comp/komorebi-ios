@@ -145,7 +145,6 @@ final class WeightBank {
         let info = try gguf.tensor(tensor)
         let K = info.dimensions[0]
         let N = rowList?.count ?? rowCount ?? (info.dimensions.count > 1 ? info.dimensions[1] : 1)
-        let base = gguf.pointer(for: info)
         let rowBytes = info.type.rowByteSize(elements: K)
         let type = info.type
         guard N % group == 0 else { throw GemmaEngineError.inferenceFailed("\(tensor): rows \(N) not divisible by LUT group \(group)") }
@@ -157,6 +156,10 @@ final class WeightBank {
             rows[name] = N
             return
         }
+        // A GGUF opened header-only maps just this tensor while it is quantised.
+        let mapping = gguf.mapsTensorData ? nil : try GGUFTensorMapping(gguf: gguf, tensor: info)
+        let base = mapping?.base ?? gguf.pointer(for: info)
+        defer { withExtendedLifetime(mapping) {} }
         let q = try LUTQuantizer.quantize(rows: N, cols: K, bits: bits, group: group, iterations: iterations, companded: companded) { r0, cnt, dst in
             for r in 0..<cnt {
                 let srcRow = rowList.map { Int($0[r0 + r]) } ?? (rowStart + r0 + r)

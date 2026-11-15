@@ -356,7 +356,7 @@ public final class AudioPipelineManager: ObservableObject {
         isLoadingModels = false
         let ready = CFAbsoluteTimeGetCurrent() - loadStart
         NSLog("KOMOREBI_STATUS engines loaded in %.1f s: %@", ready, statusBanner)
-        diag(String(format: "startup: ready in %.2f s", ready))
+        diag(String(format: "startup: ready in %.2f s, %@", ready, Self.memoryLine()))
         publishIPCState(committedText: nil, isDraftReplacement: false)
         let gemmaOnANE = await refiner.aneDirect != nil
         Task {
@@ -368,6 +368,17 @@ public final class AudioPipelineManager: ObservableObject {
             // Finished sentences use SenseVoice until Qwen3-ASR is up.
             await loadFinalASRIfNeeded()
         }
+    }
+
+    /// App memory (phys_footprint) and mapped address space, for the diagnostics log.
+    nonisolated static func memoryLine() -> String {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
+        }
+        guard kr == KERN_SUCCESS else { return "memory n/a" }
+        return String(format: "footprint %.0f MB, virtual %.2f GB", Double(info.phys_footprint) / 1e6, Double(info.virtual_size) / 1e9)
     }
 
     public var finalASRReady: Bool { finalASR != nil }
@@ -414,8 +425,9 @@ public final class AudioPipelineManager: ObservableObject {
             let warm = await Task.detached(priority: .utility) { qwen.warmUp() }.value
             finalASR = qwen
             finalASRStatus = "整句辨識：Qwen3-ASR-1.7B（ANE）"
-            diag(String(format: "startup: Qwen3-ASR loaded in %.2f s (%d/%d programs already compiled, %.0f MB weights), warm-up %.2f s",
-                        load, qwen.engine.cachedPrograms, qwen.engine.programCount, Double(qwen.engine.weightBytes) / 1e6, warm))
+            diag(String(format: "startup: Qwen3-ASR loaded in %.2f s (%d/%d programs already compiled, %.0f MB weights), warm-up %.2f s, %@",
+                        load, qwen.engine.cachedPrograms, qwen.engine.programCount, Double(qwen.engine.weightBytes) / 1e6, warm,
+                        Self.memoryLine()))
             NSLog("KOMOREBI_STATUS Qwen3-ASR loaded in %.1f s, warm-up %.2f s", load, warm)
         case .failure(let error):
             finalASRStatus = "整句辨識：SenseVoice（Qwen3-ASR 載入失敗：\(error.localizedDescription)）"

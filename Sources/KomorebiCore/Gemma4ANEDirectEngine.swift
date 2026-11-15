@@ -294,6 +294,9 @@ public final class Gemma4ANEDirectEngine: @unchecked Sendable {
                 lmHead = prog
             }
         }
+        // Loaded on the ANE: drop the weight blobs (1.1 GB of mapped address space; the app's address space is limited).
+        for p in programs { p.releaseWeights() }
+        lmHead?.releaseWeights()
         self.compileSeconds = compileTotal
         self.milSeconds = milSeconds
         self.buildSeconds = CFAbsoluteTimeGetCurrent() - t0

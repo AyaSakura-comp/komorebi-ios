@@ -37,6 +37,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// Symbol names of the procedure's inputs / outputs in surface order (from the compiled model description).
 - (NSArray<NSString *> *)inputNames:(int)p;
 - (NSArray<NSString *> *)outputNames:(int)p;
+/// Drops the descriptor's reference to the weight blob once the program is loaded on the ANE, so a memory-mapped blob
+/// is unmapped when the caller lets go of it too (an iOS app without the extended virtual addressing entitlement has
+/// only a few GB of address space). The loaded program keeps running; it cannot be reloaded from this object.
+- (void)releaseWeights;
 @property (nonatomic, readonly) double compileSeconds;
 /// YES when aned already had the compiled program (compile was skipped).
 @property (nonatomic, readonly) BOOL loadedFromCache;

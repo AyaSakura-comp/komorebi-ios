@@ -36,7 +36,9 @@ Mac（M4）上同一個引擎：一般解碼 40.6 tok/s、prefill 3090 tok/s，M
 | **Qwen3-ASR-1.7B，本 repo 的 ANE 引擎**（解碼器 LUT6、編碼器 LUT8，預設） | **8.84 %** | **20.7 %** | RTF 0.12（M4）：編碼器 12 ms、prefill 35–85 ms、解碼約 34 tok/s |
 | 同上，解碼器 LUT8 | 8.36 % | 21.1 % | RTF 0.15（M4）、解碼約 27 tok/s，ANE 權重多 0.35 GB |
 
+* iPhone 14 Pro Max（A16）：每句約 0.4–0.75 秒（編碼器約 20 ms、prefill 70–110 ms、解碼 14–18 tok/s），App 記憶體從 510 MB 變成約 600 MB。第一次載入要在手機上編譯 35 個 ANE 程式（約 90 秒，期間整句先用 SenseVoice），之後從系統快取載入。
 * 解碼器用 4-bit 查表會完全壞掉（MER > 100 %，一直重複同一個字），6-bit 是下限。
+* 位址空間：免費 Apple ID 不能開 Extended Virtual Addressing，App 只有幾 GB 的位址空間。兩個模型的檔案和 ANE 權重全部 map 進來（約 8 GB）會配置失敗，所以 ANE 程式載入後就放掉權重 blob，Qwen3 的 GGUF 只 map 檔頭和 embedding 表，程式一次載入三個。
 * 指定語言為中文（跟桌面版 Komorebi 對 TEA 的做法一樣）和讓模型自己判斷的 MER 相同，英文句子照樣輸出英文，每句少解碼 3 個 token。詳細量測與 ANE 編譯器的實測限制見 [`Tools/ane-direct/README.md`](Tools/ane-direct/README.md)。
 
 ## 架構

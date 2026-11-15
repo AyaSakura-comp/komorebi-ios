@@ -184,10 +184,18 @@ public final class GGUFFile: @unchecked Sendable {
     public let metadata: GGUFMetadata
     public let tensors: [String: GGUFTensorInfo]
     public let tensorDataOffset: Int
+    /// false: only the header is mapped (tensor data is read with pread / mapped per tensor), which keeps a large file
+    /// from taking gigabytes of the app's limited address space.
+    public let mapsTensorData: Bool
+    private let mappedSize: Int
 
     private let fd: Int32
 
-    public init(url: URL, loadTokenizerArrays: Bool = true) throws {
+    public convenience init(url: URL, loadTokenizerArrays: Bool = true) throws {
+        try self.init(url: url, loadTokenizerArrays: loadTokenizerArrays, mapTensorData: true)
+    }
+
+    public init(url: URL, loadTokenizerArrays: Bool = true, mapTensorData: Bool) throws {
         self.url = url
         let path = url.path
         let fd = open(path, O_RDONLY)
@@ -200,31 +208,44 @@ public final class GGUFFile: @unchecked Sendable {
         }
         let size = Int(st.st_size)
 
-        guard let mapped = mmap(nil, size, PROT_READ, MAP_PRIVATE | MAP_FILE, fd, 0),
+        var window = mapTensorData ? size : min(size, 32 << 20)
+        while true {
+            guard let probe = mmap(nil, window, PROT_READ, MAP_PRIVATE | MAP_FILE, fd, 0), probe != MAP_FAILED else {
+                let reason = String(cString: strerror(errno))
+                close(fd)
+                throw GGUFError.cannotOpen("\(path) (mmap \(window / 1_000_000) MB: \(reason))")
+            }
+            if window == size || Self.headerFits(probe, window) { munmap(probe, window); break }
+            munmap(probe, window)
+            window = min(size, window * 2)
+        }
+        guard let mapped = mmap(nil, window, PROT_READ, MAP_PRIVATE | MAP_FILE, fd, 0),
               mapped != MAP_FAILED else {
             let reason = String(cString: strerror(errno))
             close(fd)
-            throw GGUFError.cannotOpen("\(path) (mmap \(size / 1_000_000) MB: \(reason))")
+            throw GGUFError.cannotOpen("\(path) (mmap \(window / 1_000_000) MB: \(reason))")
         }
+        self.mapsTensorData = window == size
+        self.mappedSize = window
 
         // Hint sequential scan ONLY during header parse; random for lazy PLE rows.
-        madvise(mapped, min(size, 24 * 1024 * 1024), MADV_SEQUENTIAL)
+        madvise(mapped, min(window, 24 * 1024 * 1024), MADV_SEQUENTIAL)
 
         self.fd = fd
         self.fileSize = size
         self.basePointer = UnsafeRawPointer(mapped)
         self.metadata = GGUFMetadata()
 
-        var cursor = BinaryCursor(base: self.basePointer, count: size)
+        var cursor = BinaryCursor(base: self.basePointer, count: window)
         let magic = try cursor.readU32()
         guard magic == 0x46554747 else { // "GGUF" little-endian
-            munmap(mapped, size)
+            munmap(mapped, window)
             close(fd)
             throw GGUFError.invalidMagic
         }
         let version = try cursor.readU32()
         guard version == 2 || version == 3 else {
-            munmap(mapped, size)
+            munmap(mapped, window)
             close(fd)
             throw GGUFError.unsupportedVersion(version)
         }
@@ -258,7 +279,7 @@ public final class GGUFFile: @unchecked Sendable {
             }
             let rawType = try cursor.readU32()
             guard let ggmlType = GGMLType(rawValue: rawType) else {
-                munmap(mapped, size)
+                munmap(mapped, window)
                 close(fd)
                 throw GGUFError.unsupportedType(rawType)
             }
@@ -272,12 +293,41 @@ public final class GGUFFile: @unchecked Sendable {
         self.tensors = map
 
         // Switch PLE & weight region back to normal/random to avoid eager readahead of 1.93GB PLE.
-        madvise(mapped, size, MADV_RANDOM)
+        madvise(mapped, window, MADV_RANDOM)
     }
 
     deinit {
-        munmap(UnsafeMutableRawPointer(mutating: basePointer), fileSize)
+        munmap(UnsafeMutableRawPointer(mutating: basePointer), mappedSize)
         close(fd)
+    }
+
+    /// Whether a GGUF header (metadata + tensor infos) ends inside the first `count` bytes at `base`.
+    private static func headerFits(_ base: UnsafeRawPointer, _ count: Int) -> Bool {
+        var c = BinaryCursor(base: base, count: count)
+        do {
+            _ = try c.readU32(); _ = try c.readU32()
+            let nT = Int(try c.readU64()), nKV = Int(try c.readU64())
+            for _ in 0..<nKV { _ = try c.readString(); _ = try c.readValue(type: try c.readU32(), decodeLargeArrays: false) }
+            for _ in 0..<nT {
+                _ = try c.readString()
+                let nd = Int(try c.readU32())
+                for _ in 0..<nd { _ = try c.readU64() }
+                _ = try c.readU32(); _ = try c.readU64()
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Reads `count` bytes of tensor data at `offset` (relative to the tensor data) with pread.
+    private func readBytes(_ offset: Int, _ count: Int, into dst: UnsafeMutableRawPointer) throws {
+        var done = 0
+        while done < count {
+            let n = pread(fd, dst.advanced(by: done), count - done, off_t(tensorDataOffset + offset + done))
+            guard n > 0 else { throw GGUFError.truncatedFile }
+            done += n
+        }
     }
 
     public func tensor(_ name: String) throws -> GGUFTensorInfo {
@@ -288,28 +338,30 @@ public final class GGUFFile: @unchecked Sendable {
     }
 
     public func pointer(for tensor: GGUFTensorInfo) -> UnsafeRawPointer {
-        basePointer.advanced(by: tensorDataOffset + Int(tensor.offset))
+        precondition(mapsTensorData, "GGUF opened without tensor data mapped: use GGUFTensorMapping")
+        return basePointer.advanced(by: tensorDataOffset + Int(tensor.offset))
     }
 
     /// Reads an entire F32 tensor into a Swift `[Float]` array.
     public func readFloat32Tensor(_ name: String) throws -> [Float] {
         let info = try tensor(name)
+        if !mapsTensorData {
+            var raw = [UInt8](repeating: 0, count: info.byteSize)
+            try raw.withUnsafeMutableBytes { try readBytes(Int(info.offset), info.byteSize, into: $0.baseAddress!) }
+            return try raw.withUnsafeBytes { try Self.floats(info, $0.baseAddress!) }
+        }
+        return try Self.floats(info, pointer(for: info))
+    }
+
+    private static func floats(_ info: GGUFTensorInfo, _ ptr: UnsafeRawPointer) throws -> [Float] {
         let n = info.elementCount
-        let ptr = pointer(for: info)
         var out = [Float](repeating: 0, count: n)
         switch info.type {
         case .f32:
-            ptr.withMemoryRebound(to: Float.self, capacity: n) { src in
-                out.withUnsafeMutableBufferPointer { dst in
-                    _ = memcpy(dst.baseAddress!, src, n * MemoryLayout<Float>.stride)
-                }
-            }
+            out.withUnsafeMutableBytes { _ = memcpy($0.baseAddress!, ptr, n * 4) }
         case .f16:
-            ptr.withMemoryRebound(to: UInt16.self, capacity: n) { src in
-                for i in 0..<n {
-                    out[i] = Float(Float16(bitPattern: src[i]))
-                }
-            }
+            let src = ptr.assumingMemoryBound(to: UInt16.self)
+            for i in 0..<n { out[i] = Float(Float16(bitPattern: src[i])) }
         default:
             throw GGUFError.unsupportedType(info.type.rawValue)
         }
@@ -319,7 +371,18 @@ public final class GGUFFile: @unchecked Sendable {
     /// Dequantizes row `row` of a 2-D tensor (Q4_0, Q6_K, Q8_0, F16 or F32) into `dst` (`dimensions[0]` floats).
     public func dequantizeRow(tensor: GGUFTensorInfo, row: Int, into dst: UnsafeMutablePointer<Float>) throws {
         let K = tensor.dimensions[0]
-        let src = pointer(for: tensor).advanced(by: row * tensor.type.rowByteSize(elements: K))
+        let rowBytes = tensor.type.rowByteSize(elements: K)
+        if !mapsTensorData {
+            var raw = [UInt8](repeating: 0, count: rowBytes)
+            try raw.withUnsafeMutableBytes { try readBytes(Int(tensor.offset) + row * rowBytes, rowBytes, into: $0.baseAddress!) }
+            try raw.withUnsafeBytes { try Self.dequantize(tensor, src: $0.baseAddress!, into: dst) }
+            return
+        }
+        try Self.dequantize(tensor, src: pointer(for: tensor).advanced(by: row * rowBytes), into: dst)
+    }
+
+    private static func dequantize(_ tensor: GGUFTensorInfo, src: UnsafeRawPointer, into dst: UnsafeMutablePointer<Float>) throws {
+        let K = tensor.dimensions[0]
         switch tensor.type {
         case .q4_0: GGUFQuantization.dequantizeQ4_0Row(src: src, dst: dst, elements: K)
         case .q6_K: GGUFQuantization.dequantizeQ6KRow(src: src, dst: dst, elements: K)
@@ -581,6 +644,48 @@ private struct BinaryCursor {
         case 4, 5, 6: return 4
         case 10, 11, 12: return 8
         default: return 0
+        }
+    }
+}
+
+/// Read-only mapping of one GGUF tensor's bytes (the rest of the file is not mapped).
+public final class GGUFTensorMapping: @unchecked Sendable {
+    public let base: UnsafeRawPointer
+    public let info: GGUFTensorInfo
+    private let region: UnsafeMutableRawPointer
+    private let regionSize: Int
+
+    public init(gguf: GGUFFile, tensor info: GGUFTensorInfo) throws {
+        let start = gguf.tensorDataOffset + Int(info.offset)
+        let page = Int(getpagesize())
+        let aligned = start / page * page
+        let length = start - aligned + info.byteSize
+        let fd = open(gguf.url.path, O_RDONLY)
+        guard fd >= 0 else { throw GGUFError.cannotOpen("\(gguf.url.path) (open: \(String(cString: strerror(errno))))") }
+        defer { close(fd) }
+        guard let m = mmap(nil, length, PROT_READ, MAP_PRIVATE | MAP_FILE, fd, off_t(aligned)), m != MAP_FAILED else {
+            throw GGUFError.cannotOpen("\(gguf.url.path) (mmap \(length / 1_000_000) MB: \(String(cString: strerror(errno))))")
+        }
+        region = m
+        regionSize = length
+        base = UnsafeRawPointer(m).advanced(by: start - aligned)
+        self.info = info
+    }
+
+    deinit { munmap(region, regionSize) }
+
+    public func dequantizeRow(_ row: Int, into dst: UnsafeMutablePointer<Float>) {
+        let K = info.dimensions[0]
+        let src = base.advanced(by: row * info.type.rowByteSize(elements: K))
+        switch info.type {
+        case .q8_0: GGUFQuantization.dequantizeQ8_0Row(src: src, dst: dst, elements: K)
+        case .q6_K: GGUFQuantization.dequantizeQ6KRow(src: src, dst: dst, elements: K)
+        case .q4_0: GGUFQuantization.dequantizeQ4_0Row(src: src, dst: dst, elements: K)
+        case .f16:
+            let h = src.assumingMemoryBound(to: UInt16.self)
+            for j in 0..<K { dst[j] = Float(Float16(bitPattern: h[j])) }
+        default:
+            memcpy(dst, src, K * 4)
         }
     }
 }

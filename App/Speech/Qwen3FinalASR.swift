@@ -15,7 +15,7 @@ public final class Qwen3FinalASR: @unchecked Sendable {
     public var language: String? = "Chinese"
 
     public init(ggufURL: URL, cacheDirectory: URL, progress: ((String) -> Void)? = nil) throws {
-        let gguf = try GGUFFile(url: ggufURL, loadTokenizerArrays: true)
+        let gguf = try GGUFFile(url: ggufURL, loadTokenizerArrays: true, mapTensorData: false)
         engine = try Qwen3ASRANEEngine(gguf: gguf, options: .init(cacheDirectory: cacheDirectory), progress: progress)
         converter = try SenseVoiceASR.makeTWConverter()
     }

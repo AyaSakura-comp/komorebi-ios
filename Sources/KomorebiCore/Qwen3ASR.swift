@@ -261,7 +261,11 @@ public final class Qwen3ASRANEEngine: @unchecked Sendable {
         }
     }
 
-    public let gguf: GGUFFile
+    /// The whole GGUF is mapped only while the programs are built (2 GB of address space); afterwards only the
+    /// embedding table stays mapped (`embRows`).
+    private var source: GGUFFile?
+    private var gguf: GGUFFile { source! }
+    private let embRows: GGUFTensorMapping
     public let config: Qwen3ASRConfig
     public let options: Options
     public let tokens: Qwen3TokenDecoder
@@ -295,16 +299,19 @@ public final class Qwen3ASRANEEngine: @unchecked Sendable {
             throw GemmaEngineError.inferenceFailed("AppleNeuralEngine private framework unavailable")
         }
         let cfg = try Qwen3ASRConfig.from(gguf.metadata)
-        self.gguf = gguf
+        self.source = gguf
         self.config = cfg
         self.options = options
         self.tokens = try Qwen3TokenDecoder(metadata: gguf.metadata)
         self.P = options.prefillChunk
         self.embInfo = try gguf.tensor("token_embd.weight")
+        self.embRows = try GGUFTensorMapping(gguf: gguf, tensor: self.embInfo)
         self.qScratch = .allocate(capacity: options.prefillChunk * cfg.numHeads * cfg.headDim)
         self.oScratch = .allocate(capacity: options.prefillChunk * cfg.numHeads * cfg.headDim)
         self.headF32 = .allocate(capacity: cfg.vocabSize)
         try build(progress: progress)
+        // The programs are on the ANE (their blobs already released): drop the GGUF too, keeping only the embedding table.
+        source = nil
     }
 
     deinit {
@@ -353,77 +360,93 @@ public final class Qwen3ASRANEEngine: @unchecked Sendable {
         }
         func bytes(_ shape: [Int]) -> NSNumber { NSNumber(value: shape.reduce(2, *)) }
 
-        var pending: [Pending] = []
-        // Audio encoder: front end, then groups of layers (the last one also runs ln_post + projection).
+        // What to build, in order: encoder front end, encoder groups, decoder boundary programs, LM head.
+        struct Spec {
+            let tag: String
+            let procs: [[String: [NSNumber]]]
+            let inputs: [String]
+            let outputs: [String]
+            let build: (Bool) throws -> (String, Data?)
+        }
+        var specs: [Spec] = []
         let C = cfg.chunksPerWindow, W = cfg.windowTokens, D = cfg.audioHidden
-        pending.append(try prepare("enc-front", procs: [["in": [bytes([C, 1, cfg.chunkFrames, cfg.melBins])], "out": [bytes([1, W, D])]]],
-                                   inputs: ["a_mel"], outputs: ["o0_x"]) { dry in try buildFront(dryRun: dry) })
+        specs.append(Spec(tag: "enc-front", procs: [["in": [bytes([C, 1, cfg.chunkFrames, cfg.melBins])], "out": [bytes([1, W, D])]]],
+                          inputs: ["a_mel"], outputs: ["o0_x"]) { dry in try self.buildFront(dryRun: dry) })
         let per = max(1, options.encoderLayersPerProgram)
         let groups = stride(from: 0, to: cfg.audioLayers, by: per).map { ($0, min(cfg.audioLayers, $0 + per)) }
         for (gi, g) in groups.enumerated() {
             let last = gi == groups.count - 1
-            let outC = last ? cfg.audioOutput : D
-            pending.append(try prepare("enc-\(g.0)-\(g.1)", procs: [["in": [bytes([1, W, D]), bytes([1, 1, 1, Self.maskWidth(W)])],
-                                                                       "out": [bytes([1, W, outC])]]],
-                                       inputs: ["a_x", "b_mask"], outputs: ["o0_x"]) { dry in
-                try buildEncoderBlock(layers: g.0..<g.1, post: last, dryRun: dry)
+            specs.append(Spec(tag: "enc-\(g.0)-\(g.1)",
+                              procs: [["in": [bytes([1, W, D]), bytes([1, 1, 1, Self.maskWidth(W)])], "out": [bytes([1, W, last ? cfg.audioOutput : D])]]],
+                              inputs: ["a_x", "b_mask"], outputs: ["o0_x"]) { dry in
+                try self.buildEncoderBlock(layers: g.0..<g.1, post: last, dryRun: dry)
             })
         }
-        // Decoder boundary programs and the LM head.
         for b in 0...cfg.numLayers {
             let io = boundaryIO(b)
             let procs: [[String: [NSNumber]]] = [1, P].map { S in
                 ["in": io.inputs.map { NSNumber(value: S * $0.1 * 2) }, "out": io.outputs.map { NSNumber(value: S * $0.1 * 2) }]
             }
-            pending.append(try prepare("b\(b)", procs: procs, inputs: io.inputs.map { $0.0 }, outputs: io.outputs.map { $0.0 }) { dry in
-                try buildBoundary(b, dryRun: dry)
+            specs.append(Spec(tag: "b\(b)", procs: procs, inputs: io.inputs.map { $0.0 }, outputs: io.outputs.map { $0.0 }) { dry in
+                try self.buildBoundary(b, dryRun: dry)
             })
         }
-        pending.append(try prepare("lmhead", procs: [["in": [bytes([1, 1, cfg.hidden])], "out": [bytes([1, 1, cfg.vocabSize])]]],
-                                   inputs: ["a_x"], outputs: ["o0_logits"]) { dry in try buildLMHead(dryRun: dry) })
+        specs.append(Spec(tag: "lmhead", procs: [["in": [bytes([1, 1, cfg.hidden])], "out": [bytes([1, 1, cfg.vocabSize])]]],
+                          inputs: ["a_x"], outputs: ["o0_logits"]) { dry in try self.buildLMHead(dryRun: dry) })
 
-        var loaded = [Result<ANEProgram, Error>?](repeating: nil, count: pending.count)
+        // A few programs at a time, each blob dropped as soon as its program is on the ANE: all 35 blobs (1.6 GB)
+        // mapped at once do not fit next to Gemma in an iOS app's address space.
+        var loaded = [Result<ANEProgram, Error>?](repeating: nil, count: specs.count)
         let lock = NSLock()
+        let gate = DispatchSemaphore(value: 3)
         var finished = 0
-        DispatchQueue.concurrentPerform(iterations: pending.count) { i in
-            let item = pending[i]
-            let r = Result { try ANEProgram.compileMIL(item.mil, weights: item.blob, procedures: item.procs.map { $0 as [AnyHashable: Any] }) }
+        var blobBytes = 0
+        var fromCache = 0
+        DispatchQueue.concurrentPerform(iterations: specs.count) { i in
+            gate.wait()
+            defer { gate.signal() }
+            let spec = specs[i]
+            let r = Result { () -> ANEProgram in
+                let item = try prepare(spec.tag, procs: spec.procs, inputs: spec.inputs, outputs: spec.outputs, build: spec.build)
+                var prog: ANEProgram?
+                var failure: Error?
+                for attempt in 0..<3 {
+                    // A compile can fail transiently when several run at once ("cannot remove <model hash>").
+                    if attempt > 0 { Thread.sleep(forTimeInterval: 0.5) }
+                    do { prog = try ANEProgram.compileMIL(item.mil, weights: item.blob, procedures: item.procs.map { $0 as [AnyHashable: Any] }); break }
+                    catch { failure = error }
+                }
+                guard let prog else { throw GemmaEngineError.inferenceFailed("ANE compile \(item.tag) failed: \(failure?.localizedDescription ?? "?")") }
+                for p in 0..<item.procs.count {
+                    let inN = prog.inputNames(Int32(p)), outN = prog.outputNames(Int32(p)).map { $0.replacingOccurrences(of: "@output", with: "") }
+                    guard inN == item.inputs, outN == item.outputs else {
+                        throw GemmaEngineError.inferenceFailed("ANE program \(item.tag) I/O order mismatch: \(inN) / \(outN)")
+                    }
+                }
+                prog.releaseWeights()
+                lock.lock()
+                blobBytes += item.blob.count
+                if prog.loadedFromCache { fromCache += 1 }
+                lock.unlock()
+                return prog
+            }
             lock.lock()
             loaded[i] = r
             finished += 1
             let n = finished
             lock.unlock()
-            progress?("ANE program \(n)/\(pending.count)")
+            progress?("ANE program \(n)/\(specs.count)")
         }
-        for (i, item) in pending.enumerated() {
-            var result = loaded[i]!
-            // A compile can fail transiently when many run at once (aned reported "cannot remove <model hash>" once on
-            // a Mac): retry it alone.
-            var attempt = 0
-            while case .failure = result, attempt < 2 {
-                attempt += 1
-                Thread.sleep(forTimeInterval: 0.5)
-                result = Result { try ANEProgram.compileMIL(item.mil, weights: item.blob, procedures: item.procs.map { $0 as [AnyHashable: Any] }) }
-            }
-            let prog: ANEProgram
-            switch result {
-            case .success(let p): prog = p
-            case .failure(let e): throw GemmaEngineError.inferenceFailed("ANE compile \(item.tag) failed: \(e.localizedDescription)")
-            }
-            for p in 0..<item.procs.count {
-                let inN = prog.inputNames(Int32(p)), outN = prog.outputNames(Int32(p)).map { $0.replacingOccurrences(of: "@output", with: "") }
-                guard inN == item.inputs, outN == item.outputs else {
-                    throw GemmaEngineError.inferenceFailed("ANE program \(item.tag) I/O order mismatch: \(inN) / \(outN)")
-                }
-            }
-            weightBytes += item.blob.count
-            if prog.loadedFromCache { cachedPrograms += 1 }
-            if item.tag == "enc-front" { front = prog }
-            else if item.tag.hasPrefix("enc-") { blocks.append(prog) }
-            else if item.tag == "lmhead" { lmHead = prog }
+        for (i, spec) in specs.enumerated() {
+            let prog = try loaded[i]!.get()
+            if spec.tag == "enc-front" { front = prog }
+            else if spec.tag.hasPrefix("enc-") { blocks.append(prog) }
+            else if spec.tag == "lmhead" { lmHead = prog }
             else { programs.append(prog) }
         }
-        programCount = pending.count
+        weightBytes = blobBytes
+        cachedPrograms = fromCache
+        programCount = specs.count
         buildSeconds = CFAbsoluteTimeGetCurrent() - t0
     }
 
@@ -810,7 +833,7 @@ public final class Qwen3ASRANEEngine: @unchecked Sendable {
     private func embed(_ token: Int32, into dst: UnsafeMutablePointer<Float16>) {
         let H = config.hidden
         let row = UnsafeMutablePointer<Float>.allocate(capacity: H); defer { row.deallocate() }
-        try? gguf.dequantizeRow(tensor: embInfo, row: Int(max(0, min(Int32(config.vocabSize - 1), token))), into: row)
+        embRows.dequantizeRow(Int(max(0, min(Int32(config.vocabSize - 1), token))), into: row)
         for j in 0..<H { dst[j] = Float16(row[j]) }
     }
 
@@ -905,7 +928,7 @@ public final class Qwen3ASRANEEngine: @unchecked Sendable {
         var best = Int32(top[0].1)
         var bestV: Float = -.infinity
         for (_, j) in top {
-            try gguf.dequantizeRow(tensor: embInfo, row: j, into: row)
+            embRows.dequantizeRow(j, into: row)
             var v: Float = 0
             vDSP_dotpr(row, 1, h, 1, &v, vDSP_Length(H))
             if v > bestV { bestV = v; best = Int32(j) }

@@ -274,7 +274,7 @@ enum ASRSelfTest {
             log(String(format: "  SenseVoice %4.0f ms: %@", r.senseMs, r.sense))
             log("  Qwen3-ASR: \(r.qwen ?? "-") | \(r.qwenSummary ?? "")")
         }
-        log(String(format: "footprint %.0f MB", footprintMB()))
+        log(AudioPipelineManager.memoryLine())
         log("DONE")
         if ProcessInfo.processInfo.arguments.contains("--exit-after") { exit(0) }
     }
