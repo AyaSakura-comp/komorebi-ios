@@ -36,20 +36,18 @@ public actor KomorebiRefiner {
     /// attaches the MTP drafter when `drafterDirectory` holds one and, with `warmUpNow`, warms every program up.
     /// Returns a timing breakdown for the log.
     @discardableResult
-    public func loadANEDirect(cacheDirectory: URL, drafterDirectory: URL?, maxContext: Int = 1024, warmUpNow: Bool = true,
-                              progress: (@Sendable (String) -> Void)? = nil) throws -> String {
+    public func loadANEDirect(cacheDirectory: URL, drafterDirectory: URL?, maxContext: Int = 1024, dictationContext: Int? = nil,
+                              warmUpNow: Bool = true, progress: (@Sendable (String) -> Void)? = nil) throws -> String {
         guard let gguf, let tokenizer else { throw GemmaEngineError.inferenceFailed("load the GGUF first") }
         try? FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
         let t0 = CFAbsoluteTimeGetCurrent()
         let staged0 = ane_rt_staged_bytes(), stageS0 = ane_rt_stage_seconds(), desc0 = ane_rt_describe_seconds()
         let dict = FlashHeadLMHead.smallDictionary(vocab: tokenizer.vocab, tokenTypes: tokenizer.tokenTypes)
         let t1 = CFAbsoluteTimeGetCurrent()
-        let engine = try Gemma4ANEDirectEngine(
-            gguf: gguf,
-            options: .init(lutBits: 4, lutGroup: 8, prefillChunk: 64, verifyChunk: 4, maxContext: maxContext, cacheDirectory: cacheDirectory),
-            dictionary: dict,
-            progress: progress
-        )
+        var options = Gemma4ANEDirectEngine.Options(lutBits: 4, lutGroup: 8, prefillChunk: 64, verifyChunk: 4,
+                                                    maxContext: maxContext, cacheDirectory: cacheDirectory)
+        options.defaultSessionCapacity = dictationContext
+        let engine = try Gemma4ANEDirectEngine(gguf: gguf, options: options, dictionary: dict, progress: progress)
         let t2 = CFAbsoluteTimeGetCurrent()
         if let drafterDirectory {
             engine.drafter = try? Gemma4MTPDrafter(directory: drafterDirectory)
@@ -68,6 +66,62 @@ public actor KomorebiRefiner {
                       Double(ane_rt_staged_bytes() - staged0) / 1e6, ane_rt_stage_seconds() - stageS0, t3 - t2,
                       warmUpNow ? String(format: ", warm-up %.2f s", warm) : "")
     }
+
+    // MARK: - Chat (its own KV session, so dictation prompts never evict the conversation)
+
+    private var chatKV: KVSession?
+
+    /// The chat's KV session (created on first use; capacity bounded by the engine's `maxContext`).
+    private func chatSession(capacity: Int) throws -> (Gemma4ANEDirectEngine, KVSession) {
+        guard let engine = aneDirect else { throw GemmaEngineError.engineNotLoaded }
+        if let kv = chatKV { return (engine, kv) }
+        let kv = engine.makeSession(capacity: capacity)
+        chatKV = kv
+        return (engine, kv)
+    }
+
+    public func tokenize(_ text: String, addBOS: Bool) -> [Int32] {
+        tokenizer?.encode(text, addBOS: addBOS) ?? []
+    }
+
+    public func chatPromptTokens(turns: [ChatTurn]) -> [Int32] {
+        tokenizer?.encodeChat(turns: turns, addGenerationPrompt: true) ?? []
+    }
+
+    /// Tokens the chat KV session holds now (0 before the first answer).
+    public func chatCachedTokens() -> Int { chatKV?.tokens.count ?? 0 }
+
+    /// Generates a chat answer for `prompt` (token ids of the whole conversation) on the chat KV session: only the part
+    /// after the cached prefix is prefilled. `onText` receives the answer so far as it streams.
+    public func chatGenerate(prompt: [Int32], capacity: Int, maxNewTokens: Int,
+                             onText: @escaping @Sendable (String) -> Void,
+                             shouldCancel: (@Sendable () -> Bool)? = nil) throws -> (ids: [Int32], text: String, stats: GenerationStats) {
+        guard let tokenizer else { throw GemmaEngineError.inferenceFailed("Tokenizer not loaded") }
+        let (engine, kv) = try chatSession(capacity: capacity)
+        let stops: Set<Int32> = [tokenizer.eosTokenID, tokenizer.turnEndTokenID]
+        var ids: [Int32] = []
+        let (out, stats) = try engine.withSession(kv) {
+            try engine.generate(inputIDs: prompt, maxNewTokens: maxNewTokens, stopTokenIDs: stops,
+                                shouldCancel: shouldCancel, onToken: { id in
+                                    ids.append(id)
+                                    onText(tokenizer.decode(ids, skipSpecialTokens: true))
+                                })
+        }
+        return (out, tokenizer.decode(out, skipSpecialTokens: true), stats)
+    }
+
+    public func saveChatSession(to url: URL) throws {
+        guard let engine = aneDirect, let kv = chatKV, !kv.tokens.isEmpty else { return }
+        try kv.save(to: url, fingerprint: engine.kvFingerprint)
+    }
+
+    /// Restores the chat KV session saved by `saveChatSession`; returns the number of cached tokens (0 if none fit).
+    public func loadChatSession(from url: URL, capacity: Int) throws -> Int {
+        let (engine, kv) = try chatSession(capacity: capacity)
+        return kv.load(from: url, fingerprint: engine.kvFingerprint) ? kv.tokens.count : 0
+    }
+
+    public func resetChatSession() { chatKV?.reset() }
 
     /// First evaluation of every ANE program after loading is slow; this runs it once so dictation is fast.
     /// Requests that arrive meanwhile wait for it (actor). Returns the seconds it took.

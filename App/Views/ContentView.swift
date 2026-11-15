@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @ObservedObject var modelManager: ModelManager
     @ObservedObject var pipeline: AudioPipelineManager
+    @ObservedObject var chat: ChatModel
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
@@ -10,6 +11,11 @@ struct ContentView: View {
             DeskEditorView(pipeline: pipeline, modelManager: modelManager)
                 .tabItem {
                     Label("寫字桌", systemImage: "pencil.and.outline")
+                }
+
+            ChatView(chat: chat, pipeline: pipeline)
+                .tabItem {
+                    Label("聊天", systemImage: "bubble.left.and.bubble.right")
                 }
 
             KeyboardGuideView(modelManager: modelManager, pipeline: pipeline)

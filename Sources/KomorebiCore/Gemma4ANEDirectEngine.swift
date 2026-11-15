@@ -25,6 +25,8 @@ public final class Gemma4ANEDirectEngine: @unchecked Sendable {
         public var cacheDirectory: URL?
         /// Also build the ANE LM-head program when FlashHead is used (for audits / comparisons).
         public var keepANELMHead: Bool = false
+        /// Capacity of the built-in KV session (nil: `maxContext`). `maxContext` bounds every session.
+        public var defaultSessionCapacity: Int?
         public init(lutBits: Int = 4, lutGroup: Int = 8, prefillChunk: Int = 64, verifyChunk: Int = 4, maxContext: Int = 1024, cacheDirectory: URL? = nil) {
             self.lutBits = lutBits
             self.lutGroup = lutGroup
@@ -129,11 +131,14 @@ public final class Gemma4ANEDirectEngine: @unchecked Sendable {
     private let projNormEps: Float
 
     // CPU state
+    /// The active KV session's buffers (see `withSession`).
     private var kCache: [UnsafeMutablePointer<Float>] = []
     private var vCache: [UnsafeMutablePointer<Float>] = []
+    /// KV session used when no other one is active (dictation prompts).
+    public private(set) var defaultSession: KVSession!
+    private var session: KVSession!
     private var cosS: UnsafeMutablePointer<Float16>, sinS: UnsafeMutablePointer<Float16>
     private var cosF: UnsafeMutablePointer<Float16>, sinF: UnsafeMutablePointer<Float16>
-    private var cachedPrefixTokens: [Int32] = []
     private var logitsF32: UnsafeMutablePointer<Float>?
     // Persistent attention scratch (scores sized [P * nHeads, maxCtx]) so long contexts don't page-fault every call.
     private var qScratch: UnsafeMutablePointer<Float>
@@ -183,13 +188,12 @@ public final class Gemma4ANEDirectEngine: @unchecked Sendable {
         self.sinS = .allocate(capacity: self.maxCtx * cfg.slidingHeadDim)
         self.cosF = .allocate(capacity: self.maxCtx * cfg.fullHeadDim)
         self.sinF = .allocate(capacity: self.maxCtx * cfg.fullHeadDim)
-        for il in 0..<cfg.numOwnKVLayers {
-            let hd = cfg.headDim(layer: il)
-            kCache.append(UnsafeMutablePointer<Float>.allocate(capacity: maxCtx * hd))
-            vCache.append(UnsafeMutablePointer<Float>.allocate(capacity: maxCtx * hd))
-            kCache[il].initialize(repeating: 0, count: maxCtx * hd)
-            vCache[il].initialize(repeating: 0, count: maxCtx * hd)
-        }
+        let main = KVSession(capacity: min(options.defaultSessionCapacity ?? self.maxCtx, self.maxCtx),
+                             headDims: (0..<cfg.numOwnKVLayers).map { cfg.headDim(layer: $0) })
+        self.defaultSession = main
+        self.session = main
+        self.kCache = main.k
+        self.vCache = main.v
         try buildRoPETables()
 
         let t0 = CFAbsoluteTimeGetCurrent()
@@ -298,11 +302,36 @@ public final class Gemma4ANEDirectEngine: @unchecked Sendable {
         headF32?.deallocate()
         qScratch.deallocate(); oScratch.deallocate(); scoreScratch.deallocate(); pleScratch.deallocate()
         cosS.deallocate(); sinS.deallocate(); cosF.deallocate(); sinF.deallocate()
-        for p in kCache { p.deallocate() }
-        for p in vCache { p.deallocate() }
     }
 
-    public func clearPrefixCache() { cachedPrefixTokens = [] }
+    public func clearPrefixCache() { session.reset() }
+
+    /// A new, empty KV session (capacity at most `maxContext`) for a separate conversation.
+    public func makeSession(capacity: Int) -> KVSession {
+        KVSession(capacity: min(capacity, maxCtx), headDims: (0..<config.numOwnKVLayers).map { config.headDim(layer: $0) })
+    }
+
+    /// Runs `body` with `kv` as the active KV session (prompts reuse and extend its cache), then switches back.
+    public func withSession<T>(_ kv: KVSession, _ body: () throws -> T) rethrows -> T {
+        let previous = session!
+        activate(kv)
+        defer { activate(previous) }
+        return try body()
+    }
+
+    private func activate(_ kv: KVSession) {
+        session = kv
+        kCache = kv.k
+        vCache = kv.v
+    }
+
+    /// Identifies the model a saved KV session belongs to.
+    public var kvFingerprint: String {
+        "gemma4-e2b-\(gguf.fileSize)-l\(options.lutBits)g\(options.lutGroup)"
+    }
+
+    /// Context size of the active session.
+    public var activeCapacity: Int { session.capacity }
 
     /// Runs every program once in both procedures (first eval after load is slow) so the first request is warm.
     public func warmUp() throws {
@@ -310,7 +339,7 @@ public final class Gemma4ANEDirectEngine: @unchecked Sendable {
         _ = try generate(inputIDs: toks, maxNewTokens: 3, stopTokenIDs: [], staticPrefixLength: 0)
         // Also run the verify procedure (speculative decoding) once in every program and the LM head.
         _ = try forwardChunk(tokens: [Int32](repeating: config.bosTokenID, count: V), p0: toks.count, logits: .all)
-        cachedPrefixTokens = []
+        session.reset()
     }
 
     /// Measures program/procedure switching patterns (ms per eval).
@@ -554,28 +583,22 @@ public final class Gemma4ANEDirectEngine: @unchecked Sendable {
         guard !inputIDs.isEmpty else {
             return ([], GenerationStats(backend: backendName, prefixCachedTokens: 0, prefillTokens: 0, prefillSeconds: 0, decodeTokens: 0, decodeSeconds: 0))
         }
-        guard inputIDs.count < maxCtx else {
-            throw GemmaEngineError.inferenceFailed("Prompt length \(inputIDs.count) exceeds maxContext \(maxCtx)")
+        guard inputIDs.count < session.capacity else {
+            throw GemmaEngineError.inferenceFailed("Prompt length \(inputIDs.count) exceeds the context (\(session.capacity))")
         }
         lastProfile = Profile(aneSeconds: [Double](repeating: 0, count: programs.count), aneCalls: [Int](repeating: 0, count: programs.count))
 
         let t0 = CFAbsoluteTimeGetCurrent()
+        // Keys/values already in the session for the longest common prefix are reused; at least the last prompt token
+        // is run again for its logits. (`staticPrefixLength` is kept for callers; the prefix match covers it.)
+        let cached = session.tokens
         var start = 0
-        var prefixHit = false
-        // KV for the static system prefix stays valid in the CPU cache as long as the prefix tokens match.
-        if staticPrefixLength > 8, staticPrefixLength < inputIDs.count,
-           cachedPrefixTokens.count == staticPrefixLength,
-           Array(inputIDs.prefix(staticPrefixLength)) == cachedPrefixTokens {
-            start = staticPrefixLength
-            prefixHit = true
-        } else if staticPrefixLength > 8, staticPrefixLength < inputIDs.count {
-            _ = try prefill(Array(inputIDs[0..<staticPrefixLength]), p0: 0, needLogits: false)
-            cachedPrefixTokens = Array(inputIDs[0..<staticPrefixLength])
-            start = staticPrefixLength
-        } else {
-            cachedPrefixTokens = []
-        }
+        let limit = min(cached.count, inputIDs.count - 1)
+        while start < limit && cached[start] == inputIDs[start] { start += 1 }
+        let prefixHit = start > 0
+        session.tokens = Array(inputIDs[0..<start])
         var next = try prefill(Array(inputIDs[start...]), p0: start, needLogits: true)
+        session.tokens = inputIDs
         let t1 = CFAbsoluteTimeGetCurrent()
         prefillProfile = lastProfile
 
@@ -588,9 +611,11 @@ public final class Gemma4ANEDirectEngine: @unchecked Sendable {
                 try speculativeDecode(drafter: drafter, firstToken: next, lastPos: inputIDs.count - 1, maxNewTokens: maxNewTokens,
                                       stopTokenIDs: stopTokenIDs, shouldCancel: shouldCancel, onToken: onToken, out: &out)
             } else {
-                while out.count < maxNewTokens && pos < maxCtx - 1 {
+                while out.count < maxNewTokens && pos < session.capacity - 1 {
                     if shouldCancel?() == true { break }
+                    let fed = next
                     next = try forwardChunk(tokens: [next], p0: pos, logits: .last).last ?? 0
+                    session.tokens.append(fed)
                     pos += 1
                     if stopTokenIDs.contains(next) { break }
                     out.append(next)
@@ -633,7 +658,7 @@ public final class Gemma4ANEDirectEngine: @unchecked Sendable {
         let emb = tokenEmbdInfo, scale = embdScale
         while out.count < maxNewTokens {
             if shouldCancel?() == true { break }
-            let room = maxCtx - 2 - (P + 1)
+            let room = session.capacity - 2 - (P + 1)
             if room < 0 { break }
             let k = min(gamma, maxNewTokens - out.count, room)
             let td = CFAbsoluteTimeGetCurrent()
@@ -656,6 +681,9 @@ public final class Gemma4ANEDirectEngine: @unchecked Sendable {
             let g = try forwardChunk(tokens: [pending] + drafts, p0: P + 1, logits: .all)
             var acc = 0
             while acc < drafts.count && drafts[acc] == g[acc] { acc += 1 }
+            // Keys/values of the tokens that were right ([pending] + accepted drafts) are now in the cache.
+            session.tokens.append(pending)
+            session.tokens.append(contentsOf: drafts.prefix(acc))
             lastProfile.verifySteps += 1
             lastProfile.draftedTokens += drafts.count
             lastProfile.acceptedTokens += acc

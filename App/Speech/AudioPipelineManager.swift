@@ -63,6 +63,10 @@ public final class AudioPipelineManager: ObservableObject {
         }
     }
     public static let micStandbyChoices = [0, 1, 5, 10, 30]
+    /// When set (the chat tab is listening), each finished sentence's recognised text goes here instead of the draft:
+    /// no Gemma clean-up, no keyboard update.
+    public var transcriptSink: ((String) -> Void)?
+
     /// Clean up the sentence while it is still being spoken (shown in the keyboard's preview line), not only after
     /// the pause. The finished sentence is still merged into the draft as before.
     @Published public var livePreviewEnabled: Bool {
@@ -313,7 +317,8 @@ public final class AudioPipelineManager: ObservableObject {
                     // Warm-up runs after "ready" (below): listening and recognition do not need Gemma, and the first
                     // sentence's clean-up waits for the warm-up if it is still running.
                     let breakdown = try await refiner.loadANEDirect(
-                        cacheDirectory: cacheDir, drafterDirectory: modelManager.gemma4DrafterDirectory, warmUpNow: false,
+                        cacheDirectory: cacheDir, drafterDirectory: modelManager.gemma4DrafterDirectory,
+                        maxContext: ChatModel.contextCapacity, dictationContext: 1024, warmUpNow: false,
                         progress: { msg in Task { @MainActor in self.statusBanner = "準備 ANE：\(msg)" } })
                     diag("startup: ANE \(breakdown)")
                 } catch {
@@ -805,7 +810,7 @@ public final class AudioPipelineManager: ObservableObject {
     // MARK: - Live preview (clean-up while speaking)
 
     /// Draft mode with live preview: each clean-up goes straight into the text field, after the draft.
-    private var previewInField: Bool { mode == .draft && livePreviewEnabled && aneReady }
+    private var previewInField: Bool { mode == .draft && livePreviewEnabled && aneReady && transcriptSink == nil }
 
     /// The draft as the text field should show it: merged sentences plus the cleaned-up sentence being spoken.
     private func displayedDraft() -> String {
@@ -851,7 +856,7 @@ public final class AudioPipelineManager: ObservableObject {
     /// While a sentence is being spoken, cleans up its partial transcript on the ANE (one preview at a time, at most
     /// every 0.5 s, never while a finished sentence is being merged).
     private func maybeStartPreview() {
-        guard livePreviewEnabled, aneReady, isListening, !refineTaskRunning, previewTask == nil else { return }
+        guard livePreviewEnabled, aneReady, isListening, !refineTaskRunning, previewTask == nil, transcriptSink == nil else { return }
         let raw = latestPartialRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard raw.count >= 4, raw != lastPreviewRequest,
               CFAbsoluteTimeGetCurrent() - lastPreviewStart >= 0.5 else { return }
@@ -925,6 +930,16 @@ public final class AudioPipelineManager: ObservableObject {
                 continue
             }
 
+            if let sink = transcriptSink {
+                // Chat: the sentence is the user's message as recognised.
+                preeditText = ""
+                preeditTail = ""
+                keyboardPreviewRaw = ""
+                phase = isListening ? .listening : .idle
+                publishIPCState(committedText: nil, isDraftReplacement: false)
+                sink(raw)
+                continue
+            }
             phase = .refining
             // While the sentence is merged, keep showing its cleaned-up preview.
             (preeditText, preeditTail) = Self.previewDisplay(raw: raw, preview: item.preview)

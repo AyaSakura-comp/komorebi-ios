@@ -192,6 +192,16 @@ done
    * **↵**：換行並另起新草稿。
    * **停止聆聽**：停止錄音。
 
+### 聊天分頁
+
+App 底部「聊天」：跟「小葉」（Komorebi 聊天 demo 的傲嬌角色，system prompt 相同）聊天。打字，或按麥克風說話（說完停一下就送出）。右上角選單：
+* **朗讀回答**：用系統的台灣中文語音邊產生邊唸。
+* **對話模式**：小葉說完會自動再聽，她說話時暫停收音（不會聽到自己）。
+* **編輯角色**：改 system prompt。
+* **清除對話**。
+
+上方顯示上下文用量（4096 tokens）與 KV 快取。每一句只 prefill 新的部分（第一句約 376 token、之後約 15–20 token）；上下文快滿時，最舊的對話會移出窗口並由 Gemma 整理成「先前對話的重點」放進 system prompt。對話與 KV cache 存在 `Library/Application Support/komorebi-chat/`（KV 以 fp16 儲存，每個 token 約 18 KB），App 進背景時存檔，下次開啟直接讀回（約 0.02 秒）。回答會經過 OpenCC 轉成台灣繁體。
+
 ## 10. 驗證與實機測速
 
 手機要解鎖才能從 Mac 啟動 App：
@@ -215,6 +225,13 @@ xcrun devicectl device process launch --console --terminate-existing --device "$
 ```bash
 xcrun devicectl device process launch --console --terminate-existing --device "$UDID" \
   dev.ayasakura.komorebi --preview-selftest --exit-after
+```
+
+聊天的自我測試（小窗口逼出「移出窗口＋整理重點」，再測 KV 存檔讀回，最後清空聊天）：
+
+```bash
+xcrun devicectl device process launch --console --terminate-existing --device "$UDID" \
+  dev.ayasakura.komorebi --chat-selftest --exit-after
 ```
 
 App 會把麥克風工作階段的事件（開始、自動返回結果、待命、背景開始、被中斷）寫進 App 的 `Documents/komorebi-diag.log`，可以這樣拿回 Mac：

@@ -2,6 +2,8 @@
 
 完全離線的 iPhone 語音輸入法：在任何 App 切到 Komorebi 小鍵盤，講話就會出字，Gemma 4 E2B 邊聽邊整理（去贅字、套用改口、補標點；「不對，改成四點」會改到前面的句子），停頓後整句併進草稿，草稿直接顯示在輸入框裡。
 
+App 裡還有一個「聊天」分頁：跟傲嬌的「小葉」語音聊天（Komorebi 聊天 demo 的 iPhone 版），對話有自己的 KV cache，每一句只 prefill 新的部分，上下文滿了會把最舊的對話整理成重點，KV cache 存在手機上，App 重開也不用重算。
+
 語音辨識跑在 CPU（Silero VAD + SenseVoice），**Gemma 4 E2B 只跑在 Apple Neural Engine 上**：這個 repo 自己實作了一個直接呼叫 ANE 的推論引擎（私有 `AppleNeuralEngine.framework` + MIL 程式，不經過 Core ML），前景、背景一樣快，也不用 GPU，手機不會燙。
 
 > 用到 Apple 私有 API，只能自己簽章安裝（Xcode／免費 Apple ID 即可），不能上 App Store。
@@ -52,12 +54,13 @@ KomorebiVoice（主 App，背景音訊模式保持錄音）
 | `Sources/KomorebiANEDirect/ane_rt.{h,m}` | 私有 ANE API 的 ObjC 包裝：MIL + 權重 blob 編譯、載入、多入口 procedure、IOSurface 輸入輸出、eval |
 | `Sources/KomorebiANEDirect/komorebi_kernels.{h,c}` | NEON 小核心（int8 / bf16 內積、bf16 GEMV），給 LM head 精算與 MTP drafter 用 |
 | `Sources/KomorebiCore/Gemma4ANEDirectEngine.swift` | MIL 產生、LUT 量化、程式建置與快取、forward、注意力、推測解碼迴圈、profiling |
+| `Sources/KomorebiCore/KVSession.swift` | 一段對話的 KV cache：最長共同前綴重用、多個 session 共用一個引擎、fp16 存檔與讀回 |
 | `Sources/KomorebiCore/Gemma4MTPDrafter.swift` | MTP drafter（safetensors mmap，bf16） |
 | `Sources/KomorebiCore/FlashHead.swift` | 小字典建立；另含實驗性的 k-means FlashHead（實測不適合 Gemma 的 tied head，預設不用） |
 | `Sources/KomorebiCore/GGUFLoader.swift`、`Gemma4Config.swift`、`Gemma4Tokenizer.swift` | GGUF v3 mmap 讀取、Q4_0 / Q6_K 解量化、模型設定、Gemma 4 tokenizer |
 | `Sources/KomorebiCore/KomorebiRefiner.swift`、`KomorebiPrompts.swift` | 整句整理、草稿合併、圈選改寫的提示詞與接受條件 |
 | `Sources/KomorebiIPC/KomorebiIPC.swift` | 主 App ↔ 鍵盤的狀態、指令、草稿同步 |
-| `App/` | 主 App：錄音與 VAD/ASR 管線、模型下載、編輯器、`--ane-bench` 實機測速 |
+| `App/` | 主 App：錄音與 VAD/ASR 管線、模型下載、編輯器、聊天（`App/Chat/`）、`--ane-bench` 實機測速 |
 | `KeyboardExtension/` | 小鍵盤 |
 | `Tests/KomorebiCoreTests/` | macOS（Apple silicon）上的 ANE 引擎、MTP、tokenizer 測試 |
 | `AppTests/`、`UITests/` | 模擬器測試（模擬器沒有 ANE，只測語音辨識與 IPC） |

@@ -5,6 +5,7 @@ import KomorebiIPC
 struct KomorebiVoiceApp: App {
     @StateObject private var modelManager: ModelManager
     @StateObject private var pipeline: AudioPipelineManager
+    @StateObject private var chat: ChatModel
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -13,11 +14,12 @@ struct KomorebiVoiceApp: App {
         let pipe = AudioPipelineManager(modelManager: mm)
         _modelManager = StateObject(wrappedValue: mm)
         _pipeline = StateObject(wrappedValue: pipe)
+        _chat = StateObject(wrappedValue: ChatModel(pipeline: pipe))
     }
 
     var body: some Scene {
         WindowGroup {
-            ContentView(modelManager: modelManager, pipeline: pipeline)
+            ContentView(modelManager: modelManager, pipeline: pipeline, chat: chat)
                 .onOpenURL { url in
                     handleIncomingURL(url)
                 }
@@ -27,6 +29,7 @@ struct KomorebiVoiceApp: App {
                         pipeline.refreshSystemMicMode()
                     }
                     pipeline.setHostForeground(newPhase == .active)
+                    if newPhase == .background { chat.saveKV() }
                 }
                 .task {
                     if NavProbe.isActive {
@@ -39,6 +42,8 @@ struct KomorebiVoiceApp: App {
                             await MicSelfTest.run(pipeline: pipeline)
                         } else if PreviewSelfTest.isActive {
                             await PreviewSelfTest.run(pipeline: pipeline)
+                        } else if ChatSelfTest.isActive {
+                            await ChatSelfTest.run(chat: chat)
                         } else {
                             await pipeline.loadAllEnginesIfNeeded()
                         }

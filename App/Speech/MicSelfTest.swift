@@ -199,3 +199,49 @@ enum PreviewSelfTest {
         }
     }
 }
+
+/// `--chat-selftest`: a few chat turns on the device (small window to exercise eviction + memory), then a KV save/load
+/// round trip; prints prefill/cache/decode per turn. Leaves the chat empty.
+@MainActor
+enum ChatSelfTest {
+    static let isActive = ProcessInfo.processInfo.arguments.contains("--chat-selftest")
+
+    static func run(chat: ChatModel) async {
+        func log(_ s: String) { print("CHAT_SELFTEST \(s)"); fflush(stdout) }
+        await chat.pipeline.loadAllEnginesIfNeeded()
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        chat.clear()
+        chat.speakAnswers = false
+        chat.capacity = 900
+        let turns = ["我今天好累，推薦一個放鬆的方法。", "那晚餐吃什麼好？", "我比較喜歡吃辣的。", "你一開始推薦的放鬆方法是什麼？"]
+        for text in turns {
+            chat.send(text)
+            while chat.generating { try? await Task.sleep(nanoseconds: 100_000_000) }
+            let answer = chat.messages.last
+            log("USER \(text)")
+            log("  小葉 \(answer?.text ?? "-")")
+            log("  \(answer?.meta ?? "") | context \(chat.contextTokens) cached \(chat.cachedTokens)\(chat.memory.isEmpty ? "" : " | memory: \(chat.memory)")")
+        }
+        // Save, drop the cache, restore: the next turn only prefills the new message.
+        let refiner = chat.pipeline.refiner
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("chat-selftest.kkv")
+        let t0 = CFAbsoluteTimeGetCurrent()
+        try? await refiner.saveChatSession(to: url)
+        let saved = await refiner.chatCachedTokens()
+        await refiner.resetChatSession()
+        let restored = (try? await refiner.loadChatSession(from: url, capacity: ChatModel.contextCapacity)) ?? 0
+        let size = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int) ?? 0
+        log(String(format: "KV save+restore: %d -> %d tokens, %.1f MB, %.2f s", saved, restored, Double(size) / 1e6, CFAbsoluteTimeGetCurrent() - t0))
+        chat.send("謝謝你")
+        while chat.generating { try? await Task.sleep(nanoseconds: 100_000_000) }
+        log("USER 謝謝你 (after restore)")
+        log("  小葉 \(chat.messages.last?.text ?? "-")")
+        log("  \(chat.messages.last?.meta ?? "")")
+        try? FileManager.default.removeItem(at: url)
+        chat.clear()
+        chat.capacity = ChatModel.contextCapacity
+        chat.speakAnswers = true
+        log("DONE")
+        if ProcessInfo.processInfo.arguments.contains("--exit-after") { exit(0) }
+    }
+}
