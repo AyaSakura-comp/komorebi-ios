@@ -245,3 +245,72 @@ enum ChatSelfTest {
         if ProcessInfo.processInfo.arguments.contains("--exit-after") { exit(0) }
     }
 }
+
+
+/// `--asr-selftest`: every WAV in Documents/asr-test through SenseVoice and Qwen3-ASR (after both are loaded), with
+/// timings and the app's memory footprint.
+@MainActor
+enum ASRSelfTest {
+    nonisolated static let isActive = ProcessInfo.processInfo.arguments.contains("--asr-selftest")
+
+    static func run(pipeline: AudioPipelineManager) async {
+        func log(_ s: String) { print("ASR_SELFTEST \(s)"); fflush(stdout) }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        await pipeline.loadAllEnginesIfNeeded()
+        log(String(format: "engines ready in %.1f s, footprint %.0f MB", CFAbsoluteTimeGetCurrent() - t0, footprintMB()))
+        while !pipeline.finalASRReady {
+            if !pipeline.finalASRBusyLoading && CFAbsoluteTimeGetCurrent() - t0 > 30 { break }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        log(String(format: "Qwen3-ASR %@ after %.1f s: %@, footprint %.0f MB", pipeline.finalASRReady ? "ready" : "NOT ready",
+                   CFAbsoluteTimeGetCurrent() - t0, pipeline.finalASRStatus, footprintMB()))
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("asr-test")
+        let files = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == "wav" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        for url in files {
+            guard let samples = readWAV(url) else { log("\(url.lastPathComponent): unreadable"); continue }
+            let r = await pipeline.selfTestRecognize(samples)
+            log(String(format: "%@ (%.1f s)", url.lastPathComponent, Double(samples.count) / 16000))
+            log(String(format: "  SenseVoice %4.0f ms: %@", r.senseMs, r.sense))
+            log("  Qwen3-ASR: \(r.qwen ?? "-") | \(r.qwenSummary ?? "")")
+        }
+        log(String(format: "footprint %.0f MB", footprintMB()))
+        log("DONE")
+        if ProcessInfo.processInfo.arguments.contains("--exit-after") { exit(0) }
+    }
+
+    nonisolated static func footprintMB() -> Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
+        }
+        return kr == KERN_SUCCESS ? Double(info.phys_footprint) / 1e6 : -1
+    }
+
+    /// 16-bit PCM WAV at 16 kHz -> mono float.
+    nonisolated static func readWAV(_ url: URL) -> [Float]? {
+        guard let d = try? Data(contentsOf: url) else { return nil }
+        return d.withUnsafeBytes { raw -> [Float]? in
+            let b = raw.bindMemory(to: UInt8.self)
+            func u32(_ o: Int) -> Int { Int(b[o]) | Int(b[o + 1]) << 8 | Int(b[o + 2]) << 16 | Int(b[o + 3]) << 24 }
+            func u16(_ o: Int) -> Int { Int(b[o]) | Int(b[o + 1]) << 8 }
+            var o = 12, channels = 1
+            while o + 8 <= b.count {
+                let id = String(bytes: b[o..<(o + 4)], encoding: .ascii) ?? ""
+                let size = u32(o + 4)
+                if id == "fmt " { channels = u16(o + 10) }
+                if id == "data" {
+                    let frames = min(size, b.count - o - 8) / (2 * channels)
+                    return (0..<frames).map { f in
+                        var s: Float = 0
+                        for c in 0..<channels { s += Float(Int16(bitPattern: UInt16(u16(o + 8 + (f * channels + c) * 2)))) / 32768 }
+                        return s / Float(channels)
+                    }
+                }
+                o += 8 + size + (size & 1)
+            }
+            return nil
+        }
+    }
+}

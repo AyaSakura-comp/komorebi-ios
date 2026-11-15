@@ -76,6 +76,19 @@ public final class AudioPipelineManager: ObservableObject {
         }
     }
 
+    /// Read each finished sentence again with Qwen3-ASR-1.7B on the ANE (the partials stay on SenseVoice), as desktop
+    /// Komorebi does with TEA-ASR. Off (or before the engine is loaded): SenseVoice's own reading is used.
+    @Published public var qwen3FinalEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(qwen3FinalEnabled, forKey: Self.qwen3FinalDefaultsKey)
+            if qwen3FinalEnabled && isEngineLoaded { Task { await loadFinalASRIfNeeded() } }
+        }
+    }
+    /// What the finished-sentence recogniser is (engine card).
+    @Published public private(set) var finalASRStatus: String = "整句辨識：SenseVoice"
+    private var finalASR: Qwen3FinalASR?
+    private var finalASRLoading = false
+
     // Editor states (also synced with Keyboard Extension over App Group IPC)
     @Published public var mode: DictationMode = .draft
     @Published public var noiseSuppressionEnabled: Bool {
@@ -103,6 +116,7 @@ public final class AudioPipelineManager: ObservableObject {
     private static let noiseSuppressionDefaultsKey = "komorebi_noise_suppression_enabled"
     private static let micStandbyDefaultsKey = "komorebi_mic_standby_minutes"
     private static let livePreviewDefaultsKey = "komorebi_live_preview_enabled"
+    private static let qwen3FinalDefaultsKey = "komorebi_qwen3_final_enabled"
 
     public let modelManager: ModelManager
     public let refiner = KomorebiRefiner()
@@ -176,6 +190,7 @@ public final class AudioPipelineManager: ObservableObject {
         self.noiseSuppressionEnabled = UserDefaults.standard.bool(forKey: Self.noiseSuppressionDefaultsKey)
         self.micStandbyMinutes = (UserDefaults.standard.object(forKey: Self.micStandbyDefaultsKey) as? Int) ?? 10
         self.livePreviewEnabled = (UserDefaults.standard.object(forKey: Self.livePreviewDefaultsKey) as? Bool) ?? true
+        self.qwen3FinalEnabled = (UserDefaults.standard.object(forKey: Self.qwen3FinalDefaultsKey) as? Bool) ?? true
         superInitRefresh()
     }
 
@@ -343,12 +358,68 @@ public final class AudioPipelineManager: ObservableObject {
         NSLog("KOMOREBI_STATUS engines loaded in %.1f s: %@", ready, statusBanner)
         diag(String(format: "startup: ready in %.2f s", ready))
         publishIPCState(committedText: nil, isDraftReplacement: false)
-        if await refiner.aneDirect != nil {
-            Task {
+        let gemmaOnANE = await refiner.aneDirect != nil
+        Task {
+            if gemmaOnANE {
                 let seconds = (try? await refiner.warmUpANE()) ?? -1
                 diag(String(format: "startup: ANE warm-up %.2f s (after ready)", seconds))
                 NSLog("KOMOREBI_STATUS ANE warm-up %.2f s", seconds)
             }
+            // Finished sentences use SenseVoice until Qwen3-ASR is up.
+            await loadFinalASRIfNeeded()
+        }
+    }
+
+    public var finalASRReady: Bool { finalASR != nil }
+    public var finalASRBusyLoading: Bool { finalASRLoading }
+
+    /// Self-test: one clip through SenseVoice (final reading) and Qwen3-ASR.
+    public func selfTestRecognize(_ samples: [Float]) async -> (sense: String, senseMs: Double, qwen: String?, qwenSummary: String?) {
+        let sv = asr, qwen = finalASR
+        return await Task.detached(priority: .userInitiated) {
+            let s = sv?.transcribe(samples: samples, isPartial: false)
+            let q = qwen?.transcribe(samples)
+            return (s?.text ?? "-", s?.latencyMs ?? 0, q?.text, q?.result.summary)
+        }.value
+    }
+
+    /// Loads Qwen3-ASR-1.7B on the ANE for finished sentences. The first launch re-quantises its weights and compiles
+    /// the programs (a minute or two); later launches load them from the cache in a few seconds.
+    public func loadFinalASRIfNeeded() async {
+        guard qwen3FinalEnabled, finalASR == nil, !finalASRLoading else { return }
+        if isRunningInSimulator {
+            finalASRStatus = "整句辨識：SenseVoice（模擬器沒有 Neural Engine）"
+            return
+        }
+        guard let url = modelManager.qwen3ASRGGUFURL else {
+            finalASRStatus = "整句辨識：SenseVoice（找不到 Qwen3-ASR 模型）"
+            return
+        }
+        finalASRLoading = true
+        defer { finalASRLoading = false }
+        finalASRStatus = "載入 Qwen3-ASR-1.7B…"
+        let cacheDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("komorebi-ane", isDirectory: true)
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let loaded = await Task.detached(priority: .utility) { () -> Result<Qwen3FinalASR, Error> in
+            Result {
+                try Qwen3FinalASR(ggufURL: url, cacheDirectory: cacheDir) { [weak self] msg in
+                    Task { @MainActor in self?.finalASRStatus = "準備 Qwen3-ASR：\(msg)" }
+                }
+            }
+        }.value
+        switch loaded {
+        case .success(let qwen):
+            let load = CFAbsoluteTimeGetCurrent() - t0
+            let warm = await Task.detached(priority: .utility) { qwen.warmUp() }.value
+            finalASR = qwen
+            finalASRStatus = "整句辨識：Qwen3-ASR-1.7B（ANE）"
+            diag(String(format: "startup: Qwen3-ASR loaded in %.2f s (%d/%d programs already compiled, %.0f MB weights), warm-up %.2f s",
+                        load, qwen.engine.cachedPrograms, qwen.engine.programCount, Double(qwen.engine.weightBytes) / 1e6, warm))
+            NSLog("KOMOREBI_STATUS Qwen3-ASR loaded in %.1f s, warm-up %.2f s", load, warm)
+        case .failure(let error):
+            finalASRStatus = "整句辨識：SenseVoice（Qwen3-ASR 載入失敗：\(error.localizedDescription)）"
+            diag("startup: Qwen3-ASR failed: \(error.localizedDescription)")
         }
     }
 
@@ -914,9 +985,21 @@ public final class AudioPipelineManager: ObservableObject {
             }
 
             phase = .transcribing
-            let transcript = await Task.detached(priority: .userInitiated) {
-                asr.transcribe(samples: pcm, isPartial: false)
+            // The finished sentence is read again by Qwen3-ASR (ANE) when it is loaded; SenseVoice otherwise.
+            let qwen = qwen3FinalEnabled ? finalASR : nil
+            let (transcript, recognizer) = await Task.detached(priority: .userInitiated) { () -> (SenseVoiceASR.Transcript, String) in
+                if let qwen {
+                    let t0 = CFAbsoluteTimeGetCurrent()
+                    if let out = qwen.transcribe(pcm) {
+                        let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+                        return (SenseVoiceASR.Transcript(text: out.text, latencyMs: ms), "Qwen3-ASR (\(out.result.summary))")
+                    }
+                    return (asr.transcribe(samples: pcm, isPartial: false), "SenseVoice (Qwen3-ASR failed)")
+                }
+                return (asr.transcribe(samples: pcm, isPartial: false), "SenseVoice")
             }.value
+            diag(String(format: "asr: %.2f s audio, %.0f ms, %@ -> \"%@\"", Double(pcm.count) / 16000, transcript.latencyMs,
+                        recognizer, transcript.text))
 
             telemetry.asrLatencyMs = transcript.latencyMs
             let raw = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)

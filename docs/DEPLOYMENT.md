@@ -165,6 +165,39 @@ done
 
 也可以用 Finder：iPhone → 檔案 → Komorebi，把整個 `Models` 資料夾拖進去（會放在 App 的 Documents，App 也會找那裡）。
 
+### D. Qwen3-ASR-1.7B（整句辨識，建議）
+
+跟桌面版 Komorebi 用 TEA-ASR 的做法一樣：講話時的即時字幕仍是 SenseVoice（每 0.25 秒重讀一次、約 50 ms），VAD 判定一句講完後，整句交給 Qwen3-ASR-1.7B 在 ANE 上重新辨識（台灣口音中英夾雜的錯字約少一半）。沒放這個模型時，整句也用 SenseVoice，其他功能不受影響。
+
+Hugging Face 上沒有給這個引擎用的檔案，要在 Mac 上自己轉一次（需要 `uv`；參考資料那一步需要 `mlx-audio`、`transformers`、`soundfile`）：
+
+```bash
+M=~/models                                  # 放哪裡都可以，以下沿用
+hf download Qwen/Qwen3-ASR-1.7B --local-dir $M/Qwen3-ASR-1.7B
+# 1. 參考資料：原版模型（float32 音訊編碼器）對幾段錄音的各階段輸出，轉檔要用到其中的 mel 濾波器與提示詞 token
+python Tools/qwen3-asr/make_reference.py $M/Qwen3-ASR-1.7B $M/qwen3-asr-ref a.wav b.wav c.wav
+# 2. 轉成 Q8_0 GGUF（約 2.03 GiB）
+uv run --no-project --with gguf --with numpy python Tools/qwen3-asr/convert_gguf.py \
+  $M/Qwen3-ASR-1.7B $M/qwen3-asr-ref $M/qwen3-asr/qwen3-asr-1.7b-q8_0.gguf
+# 3. 複製到 App（Documents/Models/qwen3-asr/）
+xcrun devicectl device copy to --device "$UDID" --domain-type appDataContainer \
+  --domain-identifier dev.ayasakura.komorebi \
+  --source $M/qwen3-asr/qwen3-asr-1.7b-q8_0.gguf --destination Documents/Models/qwen3-asr/qwen3-asr-1.7b-q8_0.gguf
+```
+
+第一次載入時，App 會把權重轉成 ANE 的查表格式（約 1.6 GB），再編譯 35 個 ANE 程式，手機上要幾分鐘；轉好的權重存在 `Library/Application Support/komorebi-ane/qwen3asr-…/`，之後幾秒內載入。想省掉手機上的轉換，可以先在 Mac 跑一次測試（見第 10 節的 `Qwen3ASRTests`），再把 Mac 上產生的同名資料夾複製到手機的這個位置：
+
+```bash
+KEY=$(ls $TMPDIR/komorebi-qwen3asr-cache | grep qwen3asr-d6e8h6 | grep v2)
+for f in $TMPDIR/komorebi-qwen3asr-cache/$KEY/*.bin; do
+  xcrun devicectl device copy to --device "$UDID" --domain-type appDataContainer \
+    --domain-identifier dev.ayasakura.komorebi --source "$f" \
+    --destination "Library/Application Support/komorebi-ane/$KEY/$(basename $f)"
+done
+```
+
+「模型與效能」頁的「句子講完用 Qwen3-ASR 重新辨識」可以關掉（關掉就只用 SenseVoice）。
+
 ## 7. 啟用小鍵盤
 
 設定 → 一般 → 鍵盤 → 鍵盤 → 新增鍵盤 → Komorebi；再點 Komorebi → 打開「**允許完整取用**」。沒開完整取用的話，鍵盤和主 App 之間不能傳資料，鍵盤上會顯示提示。
@@ -234,7 +267,23 @@ xcrun devicectl device process launch --console --terminate-existing --device "$
   dev.ayasakura.komorebi --chat-selftest --exit-after
 ```
 
-App 會把麥克風工作階段的事件（開始、自動返回結果、待命、背景開始、被中斷）寫進 App 的 `Documents/komorebi-diag.log`，可以這樣拿回 Mac：
+語音辨識的自我測試：把 16 kHz 的 WAV 複製到 App 的 `Documents/asr-test/`，每段都用 SenseVoice 和 Qwen3-ASR 各辨識一次，列出文字、耗時（編碼器、prefill、解碼）與 App 的記憶體用量：
+
+```bash
+xcrun devicectl device copy to --device "$UDID" --domain-type appDataContainer \
+  --domain-identifier dev.ayasakura.komorebi --source a.wav --destination Documents/asr-test/a.wav
+xcrun devicectl device process launch --console --terminate-existing --device "$UDID" \
+  dev.ayasakura.komorebi --asr-selftest --exit-after
+```
+
+Mac 上的 Qwen3-ASR 測試（跟原版模型逐段比對；`QWEN3_ASR_MER` 再加跑整個測試集、輸出可計分的 JSON）：
+
+```bash
+QWEN3_ASR_GGUF=$M/qwen3-asr/qwen3-asr-1.7b-q8_0.gguf QWEN3_ASR_REF=$M/qwen3-asr-ref \
+  swift test -c release --filter Qwen3ASRTests
+```
+
+App 會把麥克風工作階段的事件（開始、自動返回結果、待命、背景開始、被中斷）和每句整句辨識的結果（用哪個辨識器、耗時）寫進 App 的 `Documents/komorebi-diag.log`，可以這樣拿回 Mac：
 
 ```bash
 xcrun devicectl device copy from --device "$UDID" --domain-type appDataContainer \

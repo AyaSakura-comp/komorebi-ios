@@ -44,6 +44,8 @@ struct KomorebiVoiceApp: App {
                             await PreviewSelfTest.run(pipeline: pipeline)
                         } else if ChatSelfTest.isActive {
                             await ChatSelfTest.run(chat: chat)
+                        } else if ASRSelfTest.isActive {
+                            await ASRSelfTest.run(pipeline: pipeline)
                         } else {
                             await pipeline.loadAllEnginesIfNeeded()
                         }

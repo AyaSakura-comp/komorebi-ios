@@ -316,6 +316,24 @@ public final class GGUFFile: @unchecked Sendable {
         return out
     }
 
+    /// Dequantizes row `row` of a 2-D tensor (Q4_0, Q6_K, Q8_0, F16 or F32) into `dst` (`dimensions[0]` floats).
+    public func dequantizeRow(tensor: GGUFTensorInfo, row: Int, into dst: UnsafeMutablePointer<Float>) throws {
+        let K = tensor.dimensions[0]
+        let src = pointer(for: tensor).advanced(by: row * tensor.type.rowByteSize(elements: K))
+        switch tensor.type {
+        case .q4_0: GGUFQuantization.dequantizeQ4_0Row(src: src, dst: dst, elements: K)
+        case .q6_K: GGUFQuantization.dequantizeQ6KRow(src: src, dst: dst, elements: K)
+        case .q8_0: GGUFQuantization.dequantizeQ8_0Row(src: src, dst: dst, elements: K)
+        case .f16:
+            let h = src.assumingMemoryBound(to: UInt16.self)
+            for j in 0..<K { dst[j] = Float(Float16(bitPattern: h[j])) }
+        case .f32:
+            memcpy(dst, src, K * 4)
+        default:
+            throw GGUFError.unsupportedType(tensor.type.rawValue)
+        }
+    }
+
     /// Dequantizes a single row `rowIndex` of a Q6_K tensor directly from the mmap without touching other rows.
     public func dequantizeQ6KRow(tensor: GGUFTensorInfo, rowIndex: Int, into dst: UnsafeMutablePointer<Float>, count: Int) {
         let rowBytes = tensor.type.rowByteSize(elements: tensor.dimensions[0])
@@ -362,6 +380,20 @@ public enum GGUFQuantization {
             }
             blockPtr = blockPtr.advanced(by: 210)
             outIdx += 256
+        }
+    }
+
+    /// Dequantizes a Q8_0 row (blocks of 32 elements: fp16 scale + 32 int8, 34 bytes per block).
+    @inline(__always)
+    public static func dequantizeQ8_0Row(src: UnsafeRawPointer, dst: UnsafeMutablePointer<Float>, elements: Int) {
+        let numBlocks = elements / 32
+        var blockPtr = src
+        for b in 0..<numBlocks {
+            let d = Float(Float16(bitPattern: blockPtr.loadUnaligned(as: UInt16.self)))
+            let qs = blockPtr.advanced(by: 2).assumingMemoryBound(to: Int8.self)
+            let out = dst.advanced(by: b * 32)
+            for j in 0..<32 { out[j] = Float(qs[j]) * d }
+            blockPtr = blockPtr.advanced(by: 34)
         }
     }
 

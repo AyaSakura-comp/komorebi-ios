@@ -7,6 +7,7 @@ public enum ModelArtifactID: String, CaseIterable, Identifiable, Sendable {
     case senseVoiceInt8 = "sensevoice_int8"
     case gemma4GGUFQ4 = "gemma4_q4_0"
     case gemma4MTPDrafter = "gemma4_mtp_drafter"
+    case qwen3ASR = "qwen3_asr_1_7b"
 
     public var id: String { rawValue }
 
@@ -16,6 +17,7 @@ public enum ModelArtifactID: String, CaseIterable, Identifiable, Sendable {
         case .senseVoiceInt8: return "SenseVoice-Small int8 + OpenCC s2twp (CPU)"
         case .gemma4GGUFQ4: return "Gemma 4 E2B Q4_0 QAT（首次啟動轉成 ANE 權重）"
         case .gemma4MTPDrafter: return "Gemma 4 E2B MTP drafter（推測解碼加速）"
+        case .qwen3ASR: return "Qwen3-ASR-1.7B Q8_0（整句辨識，首次啟動轉成 ANE 權重）"
         }
     }
 
@@ -25,11 +27,12 @@ public enum ModelArtifactID: String, CaseIterable, Identifiable, Sendable {
         case .senseVoiceInt8: return "228 MB"
         case .gemma4GGUFQ4: return "3.12 GiB"
         case .gemma4MTPDrafter: return "150 MB（建議，ANE 解碼約快 1.4–2.5 倍）"
+        case .qwen3ASR: return "2.03 GiB（建議，台灣口音中英夾雜錯字約 SenseVoice 的一半；用 Tools/qwen3-asr 轉檔）"
         }
     }
 
     public var isRequiredForCore: Bool {
-        self != .gemma4MTPDrafter
+        self != .gemma4MTPDrafter && self != .qwen3ASR
     }
 }
 
@@ -93,6 +96,11 @@ public final class ModelManager: NSObject, ObservableObject, URLSessionDownloadD
         ])
     }
 
+    /// Qwen3-ASR-1.7B converted by Tools/qwen3-asr/convert_gguf.py (finished sentences on the ANE).
+    public var qwen3ASRGGUFURL: URL? {
+        locate([rootDirectory.appendingPathComponent("qwen3-asr/qwen3-asr-1.7b-q8_0.gguf")])
+    }
+
     public var coreModelsReady: Bool {
         sileroURL != nil && senseVoiceModelURL != nil && senseVoiceTokensURL != nil && gemma4GGUFURL != nil
     }
@@ -103,6 +111,7 @@ public final class ModelManager: NSObject, ObservableObject, URLSessionDownloadD
         if senseVoiceModelURL != nil && senseVoiceTokensURL != nil { found.insert(.senseVoiceInt8) }
         if gemma4GGUFURL != nil { found.insert(.gemma4GGUFQ4) }
         if gemma4DrafterDirectory != nil { found.insert(.gemma4MTPDrafter) }
+        if qwen3ASRGGUFURL != nil { found.insert(.qwen3ASR) }
         installed = found
     }
 
@@ -160,6 +169,7 @@ public final class ModelManager: NSObject, ObservableObject, URLSessionDownloadD
             case .senseVoiceInt8: try await downloadSenseVoiceInt8()
             case .gemma4GGUFQ4: try await downloadGemma4Q4_0()
             case .gemma4MTPDrafter: try await downloadGemma4Drafter()
+            case .qwen3ASR: try await downloadQwen3ASR()
             }
             scanInstalledModels()
             statusMessage = "\(id.title) 下載完成。"
@@ -224,6 +234,20 @@ public final class ModelManager: NSObject, ObservableObject, URLSessionDownloadD
             upstreamURL: "https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/main/gemma-4-E2B_q4_0-it.gguf"
         )
         try await fetchFile(from: src, to: dest)
+    }
+
+    /// The converted GGUF is not hosted upstream: it comes from the LAN server (Tools/qwen3-asr, docs/DEPLOYMENT.md).
+    private func downloadQwen3ASR() async throws {
+        guard !lanServerBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw NSError(domain: "Komorebi", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                "Qwen3-ASR 要先在 Mac 上用 Tools/qwen3-asr 轉檔，再設定區網伺服器下載或直接複製到 App（見 docs/DEPLOYMENT.md）"])
+        }
+        activeDownload = .qwen3ASR
+        downloadProgress = 0
+        statusMessage = "下載 Qwen3-ASR-1.7B Q8_0 GGUF (2.03 GiB)…"
+        let rel = "qwen3-asr/qwen3-asr-1.7b-q8_0.gguf"
+        try await fetchFile(from: resolvedURL(relativePath: rel, upstreamURL: "https://invalid.local/\(rel)"),
+                            to: rootDirectory.appendingPathComponent(rel))
     }
 
     private func downloadGemma4Drafter() async throws {
