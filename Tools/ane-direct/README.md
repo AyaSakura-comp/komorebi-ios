@@ -91,7 +91,10 @@ Measured 2026-11-15 with the bench as the only engine in the process (`iphone_cl
   ~20-token prompts (fixed per-chunk cost).
 * Per token: 36 layer programs 29.9 ms (0.5–1.1 ms per eval; verify S = 4 costs the same as S = 1) + LM head 3.1 ms;
   CPU attention/PLE/glue < 1 ms. The A16 ANE streams LUT4 weights at ≈ 30 GB/s (M4 ≈ 55 GB/s).
-* Startup: 4.2–5.1 s when aned already has the compiled programs (first launch ever: 72 s compile). App footprint
+* Startup: 2.0–2.6 s to ready when aned already has the compiled programs (first launch ever: 72 s compile); the
+  0.5 s warm-up runs after ready. Building each `_ANEInMemoryModelDescriptor` SHA-256-hashes its weights (2.3 s for
+  1.1 GB on one core), so the 37 programs are described and loaded in parallel; cached programs load without
+  re-staging `<tmp>/<hash>/` (that wrote 1.1 GB per launch and tripped iOS's disk-write report). App footprint
   177–186 MB (ANE weights live outside the process).
 * **Background is not slower**: `--ane-bench --bg-loop 80` while switching the phone to Settings and back
   (screen on, another app in front): foreground 28.9–29.1 tok/s plain / 72–74 tok/s MTP draft rewrite, background

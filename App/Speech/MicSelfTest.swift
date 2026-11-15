@@ -59,3 +59,37 @@ enum MicSelfTest {
         }
     }
 }
+
+/// `--nav-probe [--open-app <bundle id>]`: prints which "go back" private API this iOS has and, with `--open-app`,
+/// whether LSApplicationWorkspace may open another app (the keyboard's host app is reopened that way).
+@MainActor
+enum NavProbe {
+    static let isActive = ProcessInfo.processInfo.arguments.contains("--nav-probe")
+
+    static func run(pipeline: AudioPipelineManager) async {
+        print("NAV_PROBE\n" + SystemNavigation.probe())
+        let group = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: KomorebiAppConfig.appGroupID)
+        let base = KomorebiAppConfig.containerURL()
+        print("NAV_PROBE app group container: \(group?.path ?? "nil") | IPC dir: \(base.path)")
+        print("NAV_PROBE IPC dir files: \((try? FileManager.default.contentsOfDirectory(atPath: base.path))?.sorted().joined(separator: ", ") ?? "-")")
+        let probe = (try? String(contentsOf: base.appendingPathComponent("keyboard-probe.log"), encoding: .utf8)) ?? "(none)"
+        print("NAV_PROBE keyboard probe: \(probe)")
+        let args = ProcessInfo.processInfo.arguments
+        if let i = args.firstIndex(of: "--open-app"), i + 1 < args.count {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            let t0 = Date()
+            let r = SystemNavigation.openApplication(bundleID: args[i + 1])
+            print("NAV_PROBE open-app: \(r)")
+            pipeline.diag("nav probe open-app: \(r)")
+            var left: Double?
+            while Date().timeIntervalSince(t0) < 4 {
+                if UIApplication.shared.applicationState != .active { left = Date().timeIntervalSince(t0); break }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            print("NAV_PROBE left the foreground: \(left.map { String(format: "after %.2f s", $0) } ?? "no (still active after 4 s)")")
+        }
+        print("NAV_PROBE_DONE")
+        fflush(stdout)
+        if args.contains("--exit-after") { exit(0) }
+    }
+}

@@ -174,8 +174,8 @@ done
 打開 Komorebi App。上方狀態會依序顯示：
 
 1. 「準備 ANE：ANE program n/35」：把 GGUF 的權重轉成 ANE 的 4-bit 查表格式並編譯 37 個程式。A16 上約 **72 秒**，只有第一次。
-2. 「ANE 暖機中…」
-3. 「**就緒：ANE direct (LUT4, MTP×3)**」：完成。之後每次啟動約 6 秒（轉好的權重在 App 的 `Library/Application Support/komorebi-ane/`，編譯結果由系統的 aned 保留）。
+2. 「**就緒：ANE direct (LUT4, MTP×3)**」：完成。之後每次啟動約 2–2.6 秒：轉好的權重在 App 的 `Library/Application Support/komorebi-ane/`，編譯結果由系統的 aned 保留並直接載入，37 個程式平行載入。
+3. 就緒後在背景做約 0.5 秒的 ANE 暖機（每個程式載入後第一次執行比較慢）；這段時間可以直接開始說話，第一句的整理會等暖機做完。
 
 如果顯示「就緒：僅語音辨識（Gemma 未載入：…）」，代表 ANE 引擎沒有建起來（模型不完整、私有 API 不存在等），括號裡是原因；這時仍可語音輸入，但句子不經 Gemma 整理。
 
@@ -217,7 +217,7 @@ xcrun devicectl device copy from --device "$UDID" --domain-type appDataContainer
   --domain-identifier dev.ayasakura.komorebi --source Documents/komorebi-diag.log --destination ./komorebi-diag.log
 ```
 
-正常結果（A16）大約是：`ANE_BENCH build: 4–6 s`、一般解碼 26–27 tok/s、`MTP draft` 約 69 tok/s。
+正常結果（A16）大約是：`ANE_BENCH build: 1–2 s`、一般解碼 26–28 tok/s、`MTP draft` 約 70 tok/s。
 
 Mac 上（Apple silicon）也能跑同一個 ANE 引擎的測試，模型放在 `~/models/`（結構同第 6 步）：
 
@@ -247,4 +247,4 @@ cd Tools/ane-direct && make && ./probe t1               # ANE 編譯器/頻寬�
 | 鍵盤顯示「需要『允許完整取用』」 | 第 7 步打開完整取用。 |
 | 點「語音輸入」每次都會切到 App | 只有麥克風關著時才會切（iOS 只允許前景開始錄音）。檢查「模型與效能」的「停止後麥克風待命」不是「不待命」；來電、Siri 或其他 App 用了麥克風也會結束待命。 |
 | 切到 App 後沒有自動切回原本的 App | 自動返回用的是私有 API，iOS 不支援時會記在 `komorebi-diag.log`（`return to the previous app: …`）；點左上角「◀ 返回」即可，之後待命期間不會再切。 |
-| 第一次啟動很久 | 正常：正在轉權重與編譯（A16 約 72 秒），之後約 6 秒。 |
+| 第一次啟動很久 | 正常：正在轉權重與編譯（A16 約 72 秒），之後約 2–2.6 秒。 |

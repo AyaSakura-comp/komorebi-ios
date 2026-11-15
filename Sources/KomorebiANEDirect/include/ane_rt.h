@@ -45,6 +45,12 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Number of in-memory compiles performed by this process.
 int ane_rt_compile_count(void);
+/// Seconds spent / bytes written staging programs to <tmp>/<model hash>/ for the ANE compiler (files already there
+/// are reused).
+double ane_rt_stage_seconds(void);
+/// Seconds spent creating model descriptors and their identifiers (hashes the MIL and the weights).
+double ane_rt_describe_seconds(void);
+unsigned long long ane_rt_staged_bytes(void);
 bool ane_rt_available(void);
 
 NS_ASSUME_NONNULL_END

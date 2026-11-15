@@ -86,6 +86,8 @@ public final class Gemma4ANEDirectEngine: @unchecked Sendable {
     public private(set) var lastProfile = Profile()
     public private(set) var buildSeconds: Double = 0
     public private(set) var compileSeconds: Double = 0
+    /// Seconds spent regenerating MIL text from the cached weight layout at load.
+    public private(set) var milSeconds: Double = 0
     public private(set) var weightBytes: Int = 0
 
     private var programs: [ANEProgram] = []
@@ -197,59 +199,97 @@ public final class Gemma4ANEDirectEngine: @unchecked Sendable {
         }
         if let cacheDir { try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true) }
 
-        func loadOrBuild(_ tag: String, procs: [[String: [NSNumber]]], build: (_ dryRun: Bool) throws -> (String, Data?)) throws -> ANEProgram {
+        var milSeconds = 0.0
+        /// One program to load: MIL text, weight blob (memory-mapped from the cache), procedure I/O sizes.
+        struct PendingProgram {
+            let tag: String
+            let mil: String
+            let blob: Data
+            let procs: [[String: [NSNumber]]]
+            let io: (inputs: [(String, Int)], outputs: [(String, Int)])?
+        }
+        func prepare(_ tag: String, procs: [[String: [NSNumber]]], io: (inputs: [(String, Int)], outputs: [(String, Int)])?,
+                     build: (_ dryRun: Bool) throws -> (String, Data?)) throws -> PendingProgram {
             // The weight blob (k-means LUTs) is cached; the MIL text is regenerated from a sizes-only dry run,
             // so procedures can change without re-quantising.
             var mil: String
             var blob: Data
-            if let cacheDir, let b = try? Data(contentsOf: cacheDir.appendingPathComponent("\(tag).bin"), options: .alwaysMapped) {
+            let blobURL = cacheDir?.appendingPathComponent("\(tag).bin")
+            if let blobURL, let b = try? Data(contentsOf: blobURL, options: .alwaysMapped) {
+                let tm = CFAbsoluteTimeGetCurrent()
                 mil = try build(true).0
+                milSeconds += CFAbsoluteTimeGetCurrent() - tm
                 blob = b
             } else {
                 let built = try build(false)
                 mil = built.0
                 blob = built.1 ?? Data()
-                if let cacheDir { try? blob.write(to: cacheDir.appendingPathComponent("\(tag).bin")) }
+                if let blobURL, (try? blob.write(to: blobURL)) != nil,
+                   let mapped = try? Data(contentsOf: blobURL, options: .alwaysMapped) {
+                    blob = mapped  // keep only the mapped copy while all programs load
+                }
             }
             if let cacheDir { try? mil.write(to: cacheDir.appendingPathComponent("\(tag).mil"), atomically: true, encoding: .utf8) }
-            let prog: ANEProgram
-            do {
-                prog = try ANEProgram.compileMIL(mil, weights: blob, procedures: procs.map { $0 as [AnyHashable: Any] })
-            } catch {
-                throw GemmaEngineError.inferenceFailed("ANE compile \(tag) failed: \(error.localizedDescription)")
-            }
-            compileTotal += prog.compileSeconds + prog.loadSeconds
-            weightBytes += blob.count
-            return prog
+            return PendingProgram(tag: tag, mil: mil, blob: blob, procs: procs, io: io)
         }
 
         let nL = cfg.numLayers
+        var pending: [PendingProgram] = []
         for b in 0...nL {
-            progress?("ANE program \(b)/\(nL)")
             let io = boundaryIO(b)
             let procs: [[String: [NSNumber]]] = [1, V, P].map { S in
                 ["in": io.inputs.map { NSNumber(value: S * $0.1 * 2) }, "out": io.outputs.map { NSNumber(value: S * $0.1 * 2) }]
             }
-            let prog = try loadOrBuild("b\(b)", procs: procs) { dry in try buildBoundaryProgram(b, dryRun: dry) }
-            for p in 0..<3 {
-                let inN = prog.inputNames(Int32(p)), outN = prog.outputNames(Int32(p))
-                let expIn = io.inputs.map { $0.0 }, expOut = io.outputs.map { $0.0 }
-                guard inN == expIn, outN.map({ $0.replacingOccurrences(of: "@output", with: "") }) == expOut else {
-                    throw GemmaEngineError.inferenceFailed("ANE program b\(b) I/O order mismatch: \(inN) / \(outN)")
-                }
-            }
-            programs.append(prog)
+            pending.append(try prepare("b\(b)", procs: procs, io: io) { dry in try buildBoundaryProgram(b, dryRun: dry) })
         }
-        if flashHead == nil || options.keepANELMHead {
-            progress?("ANE LM head")
+        let withLMHead = flashHead == nil || options.keepANELMHead
+        if withLMHead {
             let nRows = headRows?.count ?? cfg.vocabSize
             let tag = headRows == nil ? "lmhead" : "lmhead-dict\(nRows)"
             let procs: [[String: [NSNumber]]] = [1, V].map { S in
                 ["in": [NSNumber(value: S * cfg.hiddenSize * 2)], "out": [NSNumber(value: S * nRows * 2)]]
             }
-            lmHead = try loadOrBuild(tag, procs: procs) { dry in try buildLMHeadProgram(dryRun: dry) }
+            pending.append(try prepare(tag, procs: procs, io: nil) { dry in try buildLMHeadProgram(dryRun: dry) })
+        }
+
+        // Load every program in parallel: describing a program hashes its weights (SHA-256 over ~1.1 GB in all), which
+        // took 2.3 s on one A16 core; the loads themselves are independent.
+        var loaded = [Result<ANEProgram, Error>?](repeating: nil, count: pending.count)
+        let lock = NSLock()
+        var finished = 0
+        DispatchQueue.concurrentPerform(iterations: pending.count) { i in
+            let item = pending[i]
+            let result = Result { try ANEProgram.compileMIL(item.mil, weights: item.blob, procedures: item.procs.map { $0 as [AnyHashable: Any] }) }
+            lock.lock()
+            loaded[i] = result
+            finished += 1
+            let n = finished
+            lock.unlock()
+            progress?("ANE program \(n)/\(pending.count)")
+        }
+        for (i, item) in pending.enumerated() {
+            let prog: ANEProgram
+            switch loaded[i]! {
+            case .success(let p): prog = p
+            case .failure(let error): throw GemmaEngineError.inferenceFailed("ANE compile \(item.tag) failed: \(error.localizedDescription)")
+            }
+            compileTotal += prog.compileSeconds + prog.loadSeconds
+            weightBytes += item.blob.count
+            if let io = item.io {
+                for p in 0..<3 {
+                    let inN = prog.inputNames(Int32(p)), outN = prog.outputNames(Int32(p))
+                    let expIn = io.inputs.map { $0.0 }, expOut = io.outputs.map { $0.0 }
+                    guard inN == expIn, outN.map({ $0.replacingOccurrences(of: "@output", with: "") }) == expOut else {
+                        throw GemmaEngineError.inferenceFailed("ANE program \(item.tag) I/O order mismatch: \(inN) / \(outN)")
+                    }
+                }
+                programs.append(prog)
+            } else {
+                lmHead = prog
+            }
         }
         self.compileSeconds = compileTotal
+        self.milSeconds = milSeconds
         self.buildSeconds = CFAbsoluteTimeGetCurrent() - t0
     }
 

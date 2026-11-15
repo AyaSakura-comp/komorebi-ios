@@ -265,10 +265,13 @@ public final class AudioPipelineManager: ObservableObject {
             let asrInstance = try SenseVoiceASR(modelURL: svModel, tokensURL: svTokens, numThreads: 2)
             self.vad = vadInstance
             self.asr = asrInstance
+            let tSpeech = CFAbsoluteTimeGetCurrent()
 
             // Gemma 4 E2B runs only on the Apple Neural Engine (direct MIL engine). The first launch re-quantises the
             // weights for the ANE and compiles the programs (about a minute); later launches load them from the cache.
             try await refiner.loadGGUF(url: ggufURL)
+            let tGGUF = CFAbsoluteTimeGetCurrent()
+            diag(String(format: "startup: VAD+SenseVoice %.2f s, GGUF %.2f s", tSpeech - loadStart, tGGUF - tSpeech))
             var aneFailure: String?
             if isRunningInSimulator {
                 aneFailure = "模擬器沒有 Neural Engine"
@@ -276,8 +279,12 @@ public final class AudioPipelineManager: ObservableObject {
                 let cacheDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
                     .appendingPathComponent("komorebi-ane", isDirectory: true)
                 do {
-                    try await refiner.loadANEDirect(cacheDirectory: cacheDir, drafterDirectory: modelManager.gemma4DrafterDirectory,
-                                                    progress: { msg in Task { @MainActor in self.statusBanner = "準備 ANE：\(msg)" } })
+                    // Warm-up runs after "ready" (below): listening and recognition do not need Gemma, and the first
+                    // sentence's clean-up waits for the warm-up if it is still running.
+                    let breakdown = try await refiner.loadANEDirect(
+                        cacheDirectory: cacheDir, drafterDirectory: modelManager.gemma4DrafterDirectory, warmUpNow: false,
+                        progress: { msg in Task { @MainActor in self.statusBanner = "準備 ANE：\(msg)" } })
+                    diag("startup: ANE \(breakdown)")
                 } catch {
                     aneFailure = error.localizedDescription
                 }
@@ -295,8 +302,17 @@ public final class AudioPipelineManager: ObservableObject {
             statusBanner = "模型載入失敗：\(error.localizedDescription)"
         }
         isLoadingModels = false
-        NSLog("KOMOREBI_STATUS engines loaded in %.1f s: %@", CFAbsoluteTimeGetCurrent() - loadStart, statusBanner)
+        let ready = CFAbsoluteTimeGetCurrent() - loadStart
+        NSLog("KOMOREBI_STATUS engines loaded in %.1f s: %@", ready, statusBanner)
+        diag(String(format: "startup: ready in %.2f s", ready))
         publishIPCState(committedText: nil, isDraftReplacement: false)
+        if await refiner.aneDirect != nil {
+            Task {
+                let seconds = (try? await refiner.warmUpANE()) ?? -1
+                diag(String(format: "startup: ANE warm-up %.2f s (after ready)", seconds))
+                NSLog("KOMOREBI_STATUS ANE warm-up %.2f s", seconds)
+            }
+        }
     }
 
     private var isRunningInSimulator: Bool {
@@ -324,7 +340,7 @@ public final class AudioPipelineManager: ObservableObject {
     /// Starts listening. A new microphone session needs the app in the foreground; while one is running (listening
     /// or standby) this also works in the background, which is how the keyboard starts again without opening the app.
     /// `returnToCaller`: after the microphone starts, go back to the app that opened Komorebi (keyboard's first tap).
-    public func startListening(returnToCaller: Bool = false) async {
+    public func startListening(returnToCaller: Bool = false, hostBundleID: String? = nil) async {
         if isListening { return }
         if audioEngine == nil {
             await waitUntilActive(timeout: 2)
@@ -348,7 +364,8 @@ public final class AudioPipelineManager: ObservableObject {
             }
         }
         if returnToCaller {
-            diag("return to the previous app: \(SystemNavigation.returnToPreviousApp())")
+            let result = await SystemNavigation.returnToPreviousApp(hostBundleID: hostBundleID)
+            diag("return to the previous app: \(result)")
         }
         if !isEngineLoaded {
             publishIPCState(committedText: nil, isDraftReplacement: false)

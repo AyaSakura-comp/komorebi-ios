@@ -4,8 +4,16 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 #include <mach/mach_time.h>
+#include <os/lock.h>
 
 static Class gDesc, gInMem, gReq, gIO;
+static os_unfair_lock gStatsLock = OS_UNFAIR_LOCK_INIT;
+static double gStageSeconds = 0;
+static double gDescribeSeconds = 0;
+double ane_rt_describe_seconds(void) { return gDescribeSeconds; }
+static unsigned long long gStagedBytes = 0;
+double ane_rt_stage_seconds(void) { return gStageSeconds; }
+unsigned long long ane_rt_staged_bytes(void) { return gStagedBytes; }
 static int gCompileCount = 0;
 
 static bool ane_load(void) {
@@ -122,6 +130,7 @@ static IOSurfaceRef make_surface(size_t bytes, void **ptr) {
         return nil;
     }
     ANEProgram *p = [ANEProgram new];
+    double td0 = now_s();
     NSData *milData = [mil dataUsingEncoding:NSUTF8StringEncoding];
     NSDictionary *wdict = weights ? @{@"@model_path/weights/weight.bin": @{@"offset": @0, @"data": weights}} : @{};
     id desc = ((id(*)(Class, SEL, id, id, id))objc_msgSend)(gDesc, @selector(modelWithMILText:weights:optionsPlist:), milData, wdict, nil);
@@ -131,11 +140,28 @@ static IOSurfaceRef make_surface(size_t bytes, void **ptr) {
     }
     id mdl = ((id(*)(Class, SEL, id))objc_msgSend)(gInMem, @selector(inMemoryModelWithDescriptor:), desc);
     NSString *hx = ((id(*)(id, SEL))objc_msgSend)(mdl, @selector(hexStringIdentifier));
+    double describeDt = now_s() - td0;
+    os_unfair_lock_lock(&gStatsLock); gDescribeSeconds += describeDt; os_unfair_lock_unlock(&gStatsLock);
     NSString *td = [NSTemporaryDirectory() stringByAppendingPathComponent:hx];
     NSFileManager *fm = NSFileManager.defaultManager;
-    [fm createDirectoryAtPath:[td stringByAppendingPathComponent:@"weights"] withIntermediateDirectories:YES attributes:nil error:nil];
-    [milData writeToFile:[td stringByAppendingPathComponent:@"model.mil"] atomically:NO];
-    if (weights) [weights writeToFile:[td stringByAppendingPathComponent:@"weights/weight.bin"] atomically:NO];
+    // The compiler reads the program from <tmp>/<model hash>/. The name is a hash of the MIL and the weights, so
+    // files already there are identical: write only what is missing (the weights are ~1.1 GB per engine).
+    void (^stageFiles)(void) = ^{
+        double tw = now_s();
+        NSString *milPath = [td stringByAppendingPathComponent:@"model.mil"];
+        NSString *wPath = [td stringByAppendingPathComponent:@"weights/weight.bin"];
+        [fm createDirectoryAtPath:[td stringByAppendingPathComponent:@"weights"] withIntermediateDirectories:YES attributes:nil error:nil];
+        if ([[fm attributesOfItemAtPath:milPath error:nil] fileSize] != milData.length) {
+            [milData writeToFile:milPath atomically:NO];
+            os_unfair_lock_lock(&gStatsLock); gStagedBytes += milData.length; os_unfair_lock_unlock(&gStatsLock);
+        }
+        if (weights && [[fm attributesOfItemAtPath:wPath error:nil] fileSize] != weights.length) {
+            [weights writeToFile:wPath atomically:NO];
+            os_unfair_lock_lock(&gStatsLock); gStagedBytes += weights.length; os_unfair_lock_unlock(&gStatsLock);
+        }
+        double dt = now_s() - tw;
+        os_unfair_lock_lock(&gStatsLock); gStageSeconds += dt; os_unfair_lock_unlock(&gStatsLock);
+    };
 
     NSError *e = nil;
     double t0 = now_s();
@@ -146,18 +172,24 @@ static IOSurfaceRef make_surface(size_t bytes, void **ptr) {
     }
     BOOL ok = YES;
     if (!cached) {
+        stageFiles();
         ok = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e);
-        gCompileCount++;
+        os_unfair_lock_lock(&gStatsLock); gCompileCount++; os_unfair_lock_unlock(&gStatsLock);
     }
     double t1 = now_s();
     if (!ok) { [fm removeItemAtPath:td error:nil]; if (error) *error = e; return nil; }
     ok = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e);
     if (!ok && cached) {
-        // Stale cache entry: compile for real and retry.
+        // Loading straight from aned's cache did not work: stage the files, then load (compile if still needed).
         e = nil;
-        ok = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e);
-        gCompileCount++;
-        if (ok) ok = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e);
+        stageFiles();
+        ok = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e);
+        if (!ok) {
+            e = nil;
+            ok = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e);
+            os_unfair_lock_lock(&gStatsLock); gCompileCount++; os_unfair_lock_unlock(&gStatsLock);
+            if (ok) ok = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e);
+        }
     }
     double t2 = now_s();
     if (!ok) { [fm removeItemAtPath:td error:nil]; if (error) *error = e; return nil; }

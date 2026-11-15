@@ -75,7 +75,7 @@ final class KeyboardBridgeModel: ObservableObject {
             sendCommand(.startListening)
         } else {
             // Keyboards cannot record, and iOS only lets the app start a microphone session in the foreground:
-            // open `komorebi://listen`; the app starts the microphone and switches back here by itself.
+            // open `komorebi://listen` so the app starts the microphone (swipe back afterwards).
             controller?.openHostURL(KomorebiAppConfig.startListeningURL)
         }
     }

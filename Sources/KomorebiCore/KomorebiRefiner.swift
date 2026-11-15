@@ -1,5 +1,6 @@
 import Foundation
 import KomorebiIPC
+import KomorebiANEDirect
 
 /// High-level Komorebi text refiner on top of the direct-ANE Gemma 4 E2B engine (`Gemma4ANEDirectEngine`):
 /// sentence clean-up, draft merging and lasso rewrites with the Komorebi prompts.
@@ -21,25 +22,49 @@ public actor KomorebiRefiner {
     }
 
     /// Builds (first run: re-quantises weights to ANE LUT palettes and caches them) and loads the direct-ANE engine,
-    /// attaches the MTP drafter when `drafterDirectory` holds one, and warms every program up.
-    public func loadANEDirect(cacheDirectory: URL, drafterDirectory: URL?, maxContext: Int = 1024,
-                              progress: (@Sendable (String) -> Void)? = nil) throws {
+    /// attaches the MTP drafter when `drafterDirectory` holds one and, with `warmUpNow`, warms every program up.
+    /// Returns a timing breakdown for the log.
+    @discardableResult
+    public func loadANEDirect(cacheDirectory: URL, drafterDirectory: URL?, maxContext: Int = 1024, warmUpNow: Bool = true,
+                              progress: (@Sendable (String) -> Void)? = nil) throws -> String {
         guard let gguf, let tokenizer else { throw GemmaEngineError.inferenceFailed("load the GGUF first") }
         try? FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let staged0 = ane_rt_staged_bytes(), stageS0 = ane_rt_stage_seconds(), desc0 = ane_rt_describe_seconds()
         let dict = FlashHeadLMHead.smallDictionary(vocab: tokenizer.vocab, tokenTypes: tokenizer.tokenTypes)
+        let t1 = CFAbsoluteTimeGetCurrent()
         let engine = try Gemma4ANEDirectEngine(
             gguf: gguf,
             options: .init(lutBits: 4, lutGroup: 8, prefillChunk: 64, verifyChunk: 4, maxContext: maxContext, cacheDirectory: cacheDirectory),
             dictionary: dict,
             progress: progress
         )
+        let t2 = CFAbsoluteTimeGetCurrent()
         if let drafterDirectory {
             engine.drafter = try? Gemma4MTPDrafter(directory: drafterDirectory)
             engine.draftTokens = 3
         }
-        progress?("ANE 暖機中…")
-        try engine.warmUp()
+        let t3 = CFAbsoluteTimeGetCurrent()
+        var warm = 0.0
+        if warmUpNow {
+            progress?("ANE 暖機中…")
+            try engine.warmUp()
+            warm = CFAbsoluteTimeGetCurrent() - t3
+        }
         self.aneDirect = engine
+        return String(format: "dictionary %.2f s, engine %.2f s (MIL %.2f s, describe/hash %.2f s, ANE load %.2f s, staged %.0f MB in %.2f s), drafter %.2f s%@",
+                      t1 - t0, t2 - t1, engine.milSeconds, ane_rt_describe_seconds() - desc0, engine.compileSeconds,
+                      Double(ane_rt_staged_bytes() - staged0) / 1e6, ane_rt_stage_seconds() - stageS0, t3 - t2,
+                      warmUpNow ? String(format: ", warm-up %.2f s", warm) : "")
+    }
+
+    /// First evaluation of every ANE program after loading is slow; this runs it once so dictation is fast.
+    /// Requests that arrive meanwhile wait for it (actor). Returns the seconds it took.
+    public func warmUpANE() throws -> Double {
+        guard let engine = aneDirect else { return 0 }
+        let t = CFAbsoluteTimeGetCurrent()
+        try engine.warmUp()
+        return CFAbsoluteTimeGetCurrent() - t
     }
 
     public var aneDirectDescription: String? { aneDirect?.backendName }

@@ -29,6 +29,10 @@ struct KomorebiVoiceApp: App {
                     pipeline.setHostForeground(newPhase == .active)
                 }
                 .task {
+                    if NavProbe.isActive {
+                        await NavProbe.run(pipeline: pipeline)
+                        return
+                    }
                     modelManager.scanInstalledModels()
                     if modelManager.coreModelsReady && !ANEDirectBench.isActive {
                         if MicSelfTest.isActive {
