@@ -294,6 +294,10 @@ public final class AudioPipelineManager: ObservableObject {
     }
 
     private func performEngineLoad() async {
+        // Before any ANE program is built, so no staged compiler input is in use yet.
+        if let line = await Task.detached(priority: .utility, operation: { ModelManager.removeLeftoverFiles() }).value {
+            diag(line)
+        }
         modelManager.scanInstalledModels()
         guard modelManager.coreModelsReady,
               let sileroURL = modelManager.sileroURL,
@@ -425,9 +429,9 @@ public final class AudioPipelineManager: ObservableObject {
             let warm = await Task.detached(priority: .utility) { qwen.warmUp() }.value
             finalASR = qwen
             finalASRStatus = "整句辨識：Qwen3-ASR-1.7B（ANE）"
-            diag(String(format: "startup: Qwen3-ASR loaded in %.2f s (%d/%d programs already compiled, %.0f MB weights), warm-up %.2f s, %@",
-                        load, qwen.engine.cachedPrograms, qwen.engine.programCount, Double(qwen.engine.weightBytes) / 1e6, warm,
-                        Self.memoryLine()))
+            diag(String(format: "startup: Qwen3-ASR loaded in %.2f s (%d/%d programs already compiled, %.0f MB weights, staged %.0f MB), warm-up %.2f s, %@",
+                        load, qwen.engine.cachedPrograms, qwen.engine.programCount, Double(qwen.engine.weightBytes) / 1e6,
+                        Double(qwen.engine.stagedBytes) / 1e6, warm, Self.memoryLine()))
             NSLog("KOMOREBI_STATUS Qwen3-ASR loaded in %.1f s, warm-up %.2f s", load, warm)
         case .failure(let error):
             finalASRStatus = "整句辨識：SenseVoice（Qwen3-ASR 載入失敗：\(error.localizedDescription)）"

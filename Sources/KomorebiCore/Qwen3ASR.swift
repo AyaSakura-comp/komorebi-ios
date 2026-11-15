@@ -274,6 +274,8 @@ public final class Qwen3ASRANEEngine: @unchecked Sendable {
     /// Programs that aned already had compiled (the rest were compiled now).
     public private(set) var cachedPrograms = 0
     public private(set) var programCount = 0
+    /// Compiler input written to tmp while building (0 when every program came from aned's cache).
+    public private(set) var stagedBytes: UInt64 = 0
     /// Exact-rescoring width for the ANE LM head (candidates re-scored against the Q8_0 rows on the CPU).
     public var headRescore = 16
 
@@ -338,6 +340,7 @@ public final class Qwen3ASRANEEngine: @unchecked Sendable {
 
     private func build(progress: ((String) -> Void)?) throws {
         let t0 = CFAbsoluteTimeGetCurrent()
+        let staged0 = ane_rt_staged_bytes()
         let cfg = config
         let key = "qwen3asr-d\(options.decoderLUTBits)e\(options.encoderLUTBits)h\(options.headLUTBits)g\(options.lutGroup)p\(P)-\(gguf.fileSize)-v2"
         let cacheDir = options.cacheDirectory?.appendingPathComponent(key, isDirectory: true)
@@ -447,6 +450,7 @@ public final class Qwen3ASRANEEngine: @unchecked Sendable {
         weightBytes = blobBytes
         cachedPrograms = fromCache
         programCount = specs.count
+        stagedBytes = ane_rt_staged_bytes() - staged0
         buildSeconds = CFAbsoluteTimeGetCurrent() - t0
     }
 

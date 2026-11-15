@@ -115,6 +115,46 @@ public final class ModelManager: NSObject, ObservableObject, URLSessionDownloadD
         installed = found
     }
 
+    /// Deletes files the app no longer needs and returns a line for the diagnostics log (nil when there were none):
+    /// - `tmp/<model hash>/`: the compiler input staged for each ANE program that was compiled. Builds before this one
+    ///   meant to delete it when the program was released, which never happens before iOS kills the app, so every
+    ///   compile left its weights behind (5.5 GB on the phone by 2026-11-15). The ANE runtime now deletes it right
+    ///   after loading.
+    /// - `Library/Caches/komorebi-ane/`: Gemma palettes the ANE benchmark wrote before it moved to Application Support
+    ///   with the engines; nothing reads this copy (1.1 GB).
+    nonisolated public static func removeLeftoverFiles() -> String? {
+        let fm = FileManager.default
+        var removed = 0
+        var bytes: Int64 = 0
+        func allocated(_ url: URL) -> Int64 {
+            guard let files = fm.enumerator(at: url, includingPropertiesForKeys: [.totalFileAllocatedSizeKey]) else { return 0 }
+            var total: Int64 = 0
+            for case let file as URL in files {
+                total += Int64((try? file.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?.totalFileAllocatedSize ?? 0)
+            }
+            return total
+        }
+        func remove(_ url: URL) {
+            let size = allocated(url)
+            if (try? fm.removeItem(at: url)) != nil {
+                removed += 1
+                bytes += size
+            }
+        }
+        // `_ANEInMemoryModel.hexStringIdentifier`: SHA-256 of the MIL, the weights and the options, joined by "_".
+        let stagedName = try? NSRegularExpression(pattern: "^[0-9A-Fa-f]{64}(_[0-9A-Fa-f]{64})+$")
+        for url in (try? fm.contentsOfDirectory(at: fm.temporaryDirectory, includingPropertiesForKeys: nil)) ?? [] {
+            let name = url.lastPathComponent
+            if stagedName?.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)) != nil { remove(url) }
+        }
+        if let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first {
+            let legacy = caches.appendingPathComponent("komorebi-ane", isDirectory: true)
+            if fm.fileExists(atPath: legacy.path) { remove(legacy) }
+        }
+        guard removed > 0 else { return nil }
+        return String(format: "storage: removed %d leftover item(s), %.2f GB", removed, Double(bytes) / 1e9)
+    }
+
     /// Searches App Group Models, App Documents, App Bundle resources, and Simulator/macOS `~/models`.
     private func locate(_ primaryCandidates: [URL]) -> URL? {
         let fm = FileManager.default

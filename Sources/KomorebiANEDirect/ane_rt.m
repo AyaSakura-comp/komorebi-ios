@@ -202,7 +202,11 @@ static IOSurfaceRef make_surface(size_t bytes, void **ptr) {
     p->_compileSeconds = t1 - t0;
     p->_loadSeconds = t2 - t1;
     p->_model = mdl;
-    p->_tmpDir = td;
+    // The staged files are only the compiler's input: aned keeps the compiled program, and the next launch loads it
+    // from there without them. Delete them now. Waiting for dealloc never worked: the programs live until iOS kills
+    // the app, so every compiled program left a copy of its weights in tmp (5.5 GB on the phone).
+    [fm removeItemAtPath:td error:nil];
+    p->_tmpDir = nil;
 
     // Global symbol indices per procedure (multi-function programs number symbols across all functions).
     NSArray *procInfo = nil, *inSymAll = nil, *outSymAll = nil;

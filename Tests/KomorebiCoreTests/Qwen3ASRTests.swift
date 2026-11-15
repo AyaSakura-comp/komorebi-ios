@@ -104,9 +104,9 @@ final class Qwen3ASRTests: XCTestCase {
         if let v = env["QWEN3_ASR_HEAD_BITS"].flatMap(Int.init) { opts.headLUTBits = v }
         let t0 = CFAbsoluteTimeGetCurrent()
         let engine = try Qwen3ASRANEEngine(gguf: gguf, options: opts) { print("  \($0)") }
-        print(String(format: "engine: %@ built in %.1f s (%d/%d programs from the aned cache), weights %.0f MB",
+        print(String(format: "engine: %@ built in %.1f s (%d/%d programs from the aned cache), weights %.0f MB, staged %.0f MB",
                      engine.backendName, CFAbsoluteTimeGetCurrent() - t0, engine.cachedPrograms, engine.programCount,
-                     Double(engine.weightBytes) / 1e6))
+                     Double(engine.weightBytes) / 1e6, Double(engine.stagedBytes) / 1e6))
         try engine.warmUp()
         let m = try manifest()
         for (i, u) in m.utterances.enumerated() {

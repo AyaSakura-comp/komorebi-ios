@@ -53,7 +53,7 @@ Mac mini M4 上一句要多久：同一批句子，都指定中文、暖機後�
   * 正確率：MER 5.2 %，SenseVoice 是 13.9 %。辨識出來的文字跟 Mac 上同一個引擎 30 句全部相同。
   * 實際說話流程（`--preview-selftest`）：Gemma 同時在 ANE 上整理草稿，所以解碼降到 18–19 tok/s。7.7 秒的句子要 1.6 秒，2.4 秒的句子要 0.53 秒。
   * 記憶體：App 從 500 MB 變成約 570–600 MB。
-  * 第一次載入：每次重新安裝後第一次開啟，都要在手機上重新編譯 35 個 ANE 程式（約 90 秒，期間整句先用 SenseVoice；Gemma 的程式也要重編，就緒從 2.7 秒變成 14 秒）。之後從系統快取載入，Qwen3-ASR 約 4 秒就緒。
+  * 第一次載入：35 個 ANE 程式要在手機上編譯，約 90 秒，期間整句先用 SenseVoice。之後從系統（aned）的快取載入，Qwen3-ASR 約 4 秒就緒。系統有時會清掉部分已編譯的程式，那次開啟就要重編被清掉的那些：例如某次重裝後 Gemma 全部還在，Qwen3 35 個裡要重編 24 個（74 秒）；另一次重裝後兩個都要重編。
 * 解碼器用 4-bit 查表會完全壞掉（MER > 100 %，一直重複同一個字），6-bit 是下限。
 * 位址空間：免費 Apple ID 不能開 Extended Virtual Addressing，App 只有幾 GB 的位址空間。兩個模型的檔案和 ANE 權重全部 map 進來（約 8 GB）會配置失敗，所以 ANE 程式載入後就放掉權重 blob，Qwen3 的 GGUF 只 map 檔頭和 embedding 表，程式一次載入三個。
 * 指定語言為中文（跟桌面版 Komorebi 對 TEA 的做法一樣）和讓模型自己判斷的 MER 相同，英文句子照樣輸出英文，每句少解碼 3 個 token。詳細量測與 ANE 編譯器的實測限制見 [`Tools/ane-direct/README.md`](Tools/ane-direct/README.md)。
@@ -151,7 +151,8 @@ KomorebiVoice（主 App，背景音訊模式保持錄音）
 ### 裝置
 
 * 有 Neural Engine 的 iPhone。實測機：iPhone 14 Pro Max（A16）、iOS 27.2。部署目標是 iOS 17，但私有 ANE API 只在 iOS 27 上驗證過，其他版本可能不同。
-* 約 4 GB 可用空間（模型 3.5 GB + ANE 權重快取約 1.1 GB）；加上 Qwen3-ASR 再多約 3.6 GB（模型 2 GB + 查表快取 1.6 GB）。
+* 約 4 GB 可用空間（模型 3.5 GB + ANE 權重快取約 1.1 GB）；加上 Qwen3-ASR 再多約 3.6 GB（模型 2 GB + 查表快取 1.6 GB）。App 的資料夾實測 8.2 GB（模型 5.5 GB、ANE 查表 2.6 GB）。「iPhone 儲存空間」顯示的大小比 App 資料夾多約 6 GB，推測是系統（aned）替 App 保留的 ANE 編譯結果，App 看不到也刪不掉。
+* 編譯 ANE 程式時要先把權重寫到 `tmp/<模型雜湊>/`。舊版本來打算在程式物件釋放時刪掉這些檔，但 iOS 直接結束 App，從來沒刪過：到 2026-11-15，手機上累積了 5.5 GB，加上測速頁留在 `Library/Caches/komorebi-ane/` 的一份舊 Gemma 查表 1.1 GB。現在每個程式一載入就刪掉暫存檔；App 每次載入引擎前，也會清掉舊版留下的暫存和那份舊查表，診斷紀錄會寫「storage: removed …」。
 * 模擬器沒有 Neural Engine：App 能跑語音辨識，但 Gemma 不會載入，句子以辨識原文送出。
 
 ## 快速開始
