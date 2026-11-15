@@ -1,3 +1,5 @@
+import AVFoundation
+import Combine
 import Foundation
 import KomorebiIPC
 import UIKit
@@ -91,5 +93,90 @@ enum NavProbe {
         print("NAV_PROBE_DONE")
         fflush(stdout)
         if args.contains("--exit-after") { exit(0) }
+    }
+}
+
+/// `--preview-selftest`: synthesizes Mandarin speech, feeds it at real-time pace through VAD → ASR → Gemma, and logs
+/// what the keyboard's preview line shows while "speaking" and when the draft arrives.
+@MainActor
+enum PreviewSelfTest {
+    static let isActive = ProcessInfo.processInfo.arguments.contains("--preview-selftest")
+
+    static func run(pipeline: AudioPipelineManager) async {
+        func log(_ s: String) { print("PREVIEW_SELFTEST \(s)"); fflush(stdout) }
+        await pipeline.loadAllEnginesIfNeeded()
+        try? await Task.sleep(nanoseconds: 1_500_000_000)  // let the background warm-up finish
+        let sentences = ["呃那個我們明天下午三點在三樓會議室開會，喔不對不對，改成四點半，記得帶筆電",
+                         "然後會後一起去吃晚餐"]
+        var samples: [Float] = []
+        for text in sentences {
+            samples += await synthesize(text)
+            samples += [Float](repeating: 0, count: 16_000)  // 1 s pause between sentences
+        }
+        log(String(format: "speech %.1f s, live preview %@", Double(samples.count) / 16_000, pipeline.livePreviewEnabled ? "on" : "off"))
+
+        pipeline.resetDraft()
+        pipeline.beginSimulatedListening()
+        var shown = ""
+        let observer = pipeline.$preeditText.combineLatest(pipeline.$preeditTail).sink { main, tail in
+            let text = tail.isEmpty ? main : "\(main)〔\(tail)〕"
+            guard text != shown else { return }
+            shown = text
+            if !main.isEmpty { log(String(format: "t=%.1fs preview: %@", CFAbsoluteTimeGetCurrent() - startTime, text)) }
+        }
+        let draftObserver = pipeline.$editorText.sink { text in
+            if !text.isEmpty { log(String(format: "t=%.1fs DRAFT: %@", CFAbsoluteTimeGetCurrent() - startTime, text)) }
+        }
+        startTime = CFAbsoluteTimeGetCurrent()
+        let chunk = 1024
+        var offset = 0
+        while offset < samples.count {
+            let end = min(offset + chunk, samples.count)
+            pipeline.feedSimulatedSamples(Array(samples[offset..<end]))
+            offset = end
+            try? await Task.sleep(nanoseconds: UInt64(Double(chunk) / 16_000 * 1e9))
+        }
+        log(String(format: "t=%.1fs speech fed", CFAbsoluteTimeGetCurrent() - startTime))
+        let deadline = Date().addingTimeInterval(20)
+        while pipeline.isMergingSentence && Date() < deadline { try? await Task.sleep(nanoseconds: 100_000_000) }
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        log("final draft: \(pipeline.editorText)")
+        observer.cancel()
+        draftObserver.cancel()
+        log("DONE")
+        if ProcessInfo.processInfo.arguments.contains("--exit-after") { exit(0) }
+    }
+
+    private static var startTime: CFAbsoluteTime = 0
+    private static var synthesizer: AVSpeechSynthesizer?
+
+    /// Mandarin (Taiwan) speech as 16 kHz mono Float32.
+    private static func synthesize(_ text: String) async -> [Float] {
+        let synth = AVSpeechSynthesizer()
+        synthesizer = synth
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.voice = AVSpeechSynthesisVoice(language: "zh-TW")
+        let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
+        return await withCheckedContinuation { cont in
+            var out: [Float] = []
+            var finished = false
+            synth.write(utterance) { buffer in
+                guard let pcm = buffer as? AVAudioPCMBuffer else { return }
+                if pcm.frameLength == 0 {
+                    if !finished { finished = true; cont.resume(returning: out) }
+                    return
+                }
+                guard let conv = AVAudioConverter(from: pcm.format, to: target),
+                      let dst = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: AVAudioFrameCount(Double(pcm.frameLength) * 16_000 / pcm.format.sampleRate) + 64) else { return }
+                var fed = false
+                _ = conv.convert(to: dst, error: nil) { _, status in
+                    if fed { status.pointee = .noDataNow; return nil }
+                    fed = true
+                    status.pointee = .haveData
+                    return pcm
+                }
+                if let ch = dst.floatChannelData?[0] { out += Array(UnsafeBufferPointer(start: ch, count: Int(dst.frameLength))) }
+            }
+        }
     }
 }

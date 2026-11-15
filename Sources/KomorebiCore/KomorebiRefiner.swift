@@ -12,6 +12,15 @@ public actor KomorebiRefiner {
 
     private var cancelCounter: UInt64 = 0
 
+    /// Live previews are cancelled from any thread (the actor is busy generating), so the flag lives outside it.
+    private final class PreviewGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: UInt64 = 0
+        var current: UInt64 { lock.lock(); defer { lock.unlock() }; return value }
+        func bump() { lock.lock(); value &+= 1; lock.unlock() }
+    }
+    private nonisolated let previewGate = PreviewGate()
+
     public init() {}
 
     /// Maps the GGUF (weights stay on disk until the ANE engine re-quantises them) and loads the tokenizer.
@@ -74,6 +83,25 @@ public actor KomorebiRefiner {
         tokenizer != nil && aneDirect != nil
     }
 
+    /// Stops a running live preview at its next token (a finished sentence takes priority).
+    public nonisolated func cancelPreview() {
+        previewGate.bump()
+    }
+
+    /// Live preview while the sentence is still being spoken: the per-sentence clean-up of the partial transcript.
+    /// Returns nil when it was cancelled or the output is unusable.
+    public func previewSentence(raw: String, context: String) async throws -> GenerationResult? {
+        let gate = previewGate
+        let token = gate.current
+        let turns = KomorebiPrompts.refineTurns(raw: raw, context: context)
+        let result = try await generateChat(turns: turns, maxNewTokens: max(96, raw.count * 3 + 32),
+                                            shouldCancel: { gate.current != token })
+        guard gate.current == token else { return nil }
+        let cleaned = KomorebiPrompts.cleanModelOutput(result.text)
+        guard KomorebiPrompts.acceptRefined(raw: raw, refined: cleaned) else { return nil }
+        return GenerationResult(text: cleaned, tokenIDs: result.tokenIDs, stats: result.stats)
+    }
+
     public func cancelPending() {
         cancelCounter &+= 1
     }
@@ -131,7 +159,8 @@ public actor KomorebiRefiner {
         return GenerationResult(text: text, tokenIDs: res.tokenIDs, stats: res.stats)
     }
 
-    public func generateChat(turns: [ChatTurn], maxNewTokens: Int = 256) async throws -> GenerationResult {
+    public func generateChat(turns: [ChatTurn], maxNewTokens: Int = 256,
+                             shouldCancel: (@Sendable () -> Bool)? = nil) async throws -> GenerationResult {
         guard let tokenizer else {
             throw GemmaEngineError.inferenceFailed("Tokenizer not loaded")
         }
@@ -149,7 +178,8 @@ public actor KomorebiRefiner {
 
         let stopIDs: Set<Int32> = [tokenizer.eosTokenID, tokenizer.turnEndTokenID]
         let (outIDs, stats) = try engine.generate(inputIDs: inputIDs, maxNewTokens: maxNewTokens,
-                                                  stopTokenIDs: stopIDs, staticPrefixLength: prefixLen)
+                                                  stopTokenIDs: stopIDs, staticPrefixLength: prefixLen,
+                                                  shouldCancel: shouldCancel)
         let decoded = tokenizer.decode(outIDs, skipSpecialTokens: true)
         return GenerationResult(text: decoded, tokenIDs: outIDs, stats: stats)
     }

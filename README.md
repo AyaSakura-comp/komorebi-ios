@@ -1,6 +1,6 @@
 # 木漏れ日 · Komorebi 語音輸入法 for iOS
 
-完全離線的 iPhone 語音輸入法：在任何 App 切到 Komorebi 小鍵盤，講話就會出字，再由 Gemma 4 E2B 去贅字、套用改口（「不對，改成四點」會改到前面的句子）、補標點，整理好的草稿直接顯示在輸入框裡。
+完全離線的 iPhone 語音輸入法：在任何 App 切到 Komorebi 小鍵盤，講話就會出字，Gemma 4 E2B 邊聽邊整理（去贅字、套用改口、補標點；「不對，改成四點」會改到前面的句子），停頓後整句併進草稿，草稿直接顯示在輸入框裡。
 
 語音辨識跑在 CPU（Silero VAD + SenseVoice），**Gemma 4 E2B 只跑在 Apple Neural Engine 上**：這個 repo 自己實作了一個直接呼叫 ANE 的推論引擎（私有 `AppleNeuralEngine.framework` + MIL 程式，不經過 Core ML），前景、背景一樣快，也不用 GPU，手機不會燙。
 

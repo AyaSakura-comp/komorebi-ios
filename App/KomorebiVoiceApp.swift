@@ -37,6 +37,8 @@ struct KomorebiVoiceApp: App {
                     if modelManager.coreModelsReady && !ANEDirectBench.isActive {
                         if MicSelfTest.isActive {
                             await MicSelfTest.run(pipeline: pipeline)
+                        } else if PreviewSelfTest.isActive {
+                            await PreviewSelfTest.run(pipeline: pipeline)
                         } else {
                             await pipeline.loadAllEnginesIfNeeded()
                         }

@@ -184,7 +184,7 @@ done
 1. 在任何 App 的輸入框切到 Komorebi 鍵盤（地球鍵）。
 2. 點「語音輸入」。iOS 不讓鍵盤擴充使用麥克風，也只允許 App 在前景開始錄音，所以麥克風關著時會切到 Komorebi App 開麥克風，再自動切回原本的 App（沒有切回來的話，點左上角「◀ 返回」）。
    停止聆聽後麥克風會**待命**（預設 10 分鐘，「模型與效能」頁可改成 1／5／10／30 分鐘或不待命）：這段時間內再點「語音輸入」直接開始，不會跳轉。待命時鍵盤狀態顯示「麥克風待命中」，按「關麥」可以馬上關掉；狀態列的麥克風指示燈會亮著，但聲音不會被處理。來電或其他 App 搶走麥克風時待命會結束。
-3. 直接說話。停頓後句子會被整理成草稿，**草稿就顯示在輸入框裡**；之後說的話會合併進同一份草稿，說「不對，改成…」可以改前面的內容。
+3. 直接說話。**邊說邊整理**：說話時鍵盤的預覽列每隔約半秒就顯示 Gemma 先整理好的這一句（之後新聽到的字以淡色接在後面）；停頓後整句會合併進草稿，**草稿就顯示在輸入框裡**。之後說的話會合併進同一份草稿，說「不對，改成…」可以改前面的內容。「模型與效能」頁可以關掉邊說邊整理（關掉時預覽列顯示辨識原文）。
 4. 鍵盤按鈕：
    * **⌫**：刪字，草稿會同步（刪掉的字不會被下一句帶回來）。
    * **斷句**（聆聽中）：不等停頓，立刻整理剛剛說的話。
@@ -208,6 +208,13 @@ xcrun devicectl device process launch --console --terminate-existing --device "$
 # 由 App Group 送出鍵盤的開始/停止/關麥指令，檢查背景也收得到聲音
 xcrun devicectl device process launch --console --terminate-existing --device "$UDID" \
   dev.ayasakura.komorebi --mic-selftest --exit-after
+```
+
+邊說邊整理的自我測試（用合成語音照說話速度餵進辨識，列出預覽列每次的內容與草稿出現的時間）：
+
+```bash
+xcrun devicectl device process launch --console --terminate-existing --device "$UDID" \
+  dev.ayasakura.komorebi --preview-selftest --exit-after
 ```
 
 App 會把麥克風工作階段的事件（開始、自動返回結果、待命、背景開始、被中斷）寫進 App 的 `Documents/komorebi-diag.log`，可以這樣拿回 Mac：

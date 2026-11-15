@@ -129,10 +129,13 @@ struct KeyboardView: View {
                         .foregroundStyle(KeyboardPalette.persimmon(scheme))
                         .lineLimit(2)
                 } else if !bridge.state.partialText.isEmpty {
-                    Text(bridge.state.partialText)
+                    (Text(bridge.state.partialText)
+                        .foregroundColor(KeyboardPalette.ink(scheme))
+                     + Text(bridge.state.partialTail)
+                        .foregroundColor(KeyboardPalette.muted(scheme)))
                         .font(.callout)
-                        .foregroundStyle(KeyboardPalette.ink(scheme))
                         .lineLimit(2)
+                        .truncationMode(.head)
                 } else if isListening {
                     Text("直接說話，停頓後整理進上方輸入框（那就是草稿，⌫ 刪字會同步）。「斷句」＝不等停頓立刻整理")
                         .font(.caption)

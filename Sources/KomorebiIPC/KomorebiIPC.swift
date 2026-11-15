@@ -101,6 +101,8 @@ public struct KomorebiIPCState: Codable, Equatable, Sendable {
     public var micStandbyUntil: TimeInterval
     /// The host is still loading the speech and Gemma engines.
     public var enginesLoading: Bool
+    /// Words recognised after the last live clean-up of the sentence being spoken (shown dimmed after `partialText`).
+    public var partialTail: String
 
     public init(
         sequence: UInt64 = 0,
@@ -123,7 +125,8 @@ public struct KomorebiIPCState: Codable, Equatable, Sendable {
         hostSessionID: UInt64 = 0,
         micLive: Bool = false,
         micStandbyUntil: TimeInterval = 0,
-        enginesLoading: Bool = false
+        enginesLoading: Bool = false,
+        partialTail: String = ""
     ) {
         self.sequence = sequence
         self.updatedAt = updatedAt
@@ -146,6 +149,7 @@ public struct KomorebiIPCState: Codable, Equatable, Sendable {
         self.micLive = micLive
         self.micStandbyUntil = micStandbyUntil
         self.enginesLoading = enginesLoading
+        self.partialTail = partialTail
     }
 
     public init(from decoder: Decoder) throws {
@@ -171,6 +175,7 @@ public struct KomorebiIPCState: Codable, Equatable, Sendable {
         micLive = try c.decodeIfPresent(Bool.self, forKey: .micLive) ?? false
         micStandbyUntil = try c.decodeIfPresent(TimeInterval.self, forKey: .micStandbyUntil) ?? 0
         enginesLoading = try c.decodeIfPresent(Bool.self, forKey: .enginesLoading) ?? false
+        partialTail = try c.decodeIfPresent(String.self, forKey: .partialTail) ?? ""
     }
 }
 

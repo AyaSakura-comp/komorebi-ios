@@ -63,6 +63,14 @@ public final class AudioPipelineManager: ObservableObject {
         }
     }
     public static let micStandbyChoices = [0, 1, 5, 10, 30]
+    /// Clean up the sentence while it is still being spoken (shown in the keyboard's preview line), not only after
+    /// the pause. The finished sentence is still merged into the draft as before.
+    @Published public var livePreviewEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(livePreviewEnabled, forKey: Self.livePreviewDefaultsKey)
+            if !livePreviewEnabled { endLivePreview() }
+        }
+    }
 
     // Editor states (also synced with Keyboard Extension over App Group IPC)
     @Published public var mode: DictationMode = .draft
@@ -82,12 +90,15 @@ public final class AudioPipelineManager: ObservableObject {
     public private(set) var hostInForeground: Bool = true
     @Published public var editorText: String = ""
     @Published public var preeditText: String = ""
+    /// Words heard after the last live clean-up (dimmed after `preeditText`).
+    @Published public private(set) var preeditTail: String = ""
     @Published public private(set) var freshRange: NSRange?
     @Published public private(set) var statusBanner: String = "準備就緒"
     @Published public private(set) var telemetry: KomorebiTelemetry = KomorebiTelemetry()
 
     private static let noiseSuppressionDefaultsKey = "komorebi_noise_suppression_enabled"
     private static let micStandbyDefaultsKey = "komorebi_mic_standby_minutes"
+    private static let livePreviewDefaultsKey = "komorebi_live_preview_enabled"
 
     public let modelManager: ModelManager
     public let refiner = KomorebiRefiner()
@@ -106,7 +117,15 @@ public final class AudioPipelineManager: ObservableObject {
 
     private let processingQueue = DispatchQueue(label: "dev.ayasakura.komorebi.audio-vad", qos: .userInitiated)
     private var partialTaskInFlight = false
-    private var refineQueue: [[Float]] = []
+    /// Finished sentences waiting for the draft merge, with the live preview shown for each when it finished.
+    private var refineQueue: [(pcm: [Float], preview: (raw: String, refined: String)?)] = []
+    private var aneReady = false
+    private var previewTask: Task<Void, Never>?
+    private var lastPreviewRequest = ""
+    private var lastPreviewStart: CFAbsoluteTime = 0
+    private var latestPartialRaw = ""
+    private var livePreview: (raw: String, refined: String)?
+    private var utteranceSerial = 0
     private var refineTaskRunning = false
 
     private final class WeakPipelineRef: @unchecked Sendable {
@@ -141,6 +160,7 @@ public final class AudioPipelineManager: ObservableObject {
         }
         self.noiseSuppressionEnabled = UserDefaults.standard.bool(forKey: Self.noiseSuppressionDefaultsKey)
         self.micStandbyMinutes = (UserDefaults.standard.object(forKey: Self.micStandbyDefaultsKey) as? Int) ?? 10
+        self.livePreviewEnabled = (UserDefaults.standard.object(forKey: Self.livePreviewDefaultsKey) as? Bool) ?? true
         superInitRefresh()
     }
 
@@ -292,6 +312,7 @@ public final class AudioPipelineManager: ObservableObject {
 
             // Listening only needs VAD + ASR; without the ANE engine sentences are inserted as recognised.
             isEngineLoaded = true
+            aneReady = await refiner.aneDirect != nil
             if let desc = await refiner.aneDirectDescription {
                 statusBanner = "就緒：\(desc)"
             } else {
@@ -549,6 +570,7 @@ public final class AudioPipelineManager: ObservableObject {
         audioGate.isOpen = false
         isListening = false
         micLevel = 0
+        refiner.cancelPreview()
         if wasListening, let vad {
             processingQueue.async { [weak self] in
                 let flushEvents = vad.flush()
@@ -708,14 +730,17 @@ public final class AudioPipelineManager: ObservableObject {
                 Task { @MainActor in
                     guard !self.partialTaskInFlight, let asr = self.asr else { return }
                     self.partialTaskInFlight = true
+                    let serial = self.utteranceSerial
                     Task.detached(priority: .userInitiated) {
                         let res = asr.transcribe(samples: pcm, isPartial: true)
                         await MainActor.run {
                             self.partialTaskInFlight = false
-                            if self.isListening && !res.text.isEmpty {
-                                self.preeditText = res.text
+                            // A partial that started before the sentence finished belongs to the finished sentence.
+                            if self.isListening && !res.text.isEmpty && self.utteranceSerial == serial {
+                                self.showPartial(res.text)
                                 self.telemetry.asrLatencyMs = res.latencyMs
                                 self.publishIPCState(committedText: nil, isDraftReplacement: false)
+                                self.maybeStartPreview()
                             }
                         }
                     }
@@ -729,8 +754,88 @@ public final class AudioPipelineManager: ObservableObject {
         }
     }
 
+    // MARK: - Simulated speech (self-test)
+
+    /// Starts "listening" without the microphone so a self-test can feed recorded/synthesized speech.
+    func beginSimulatedListening() {
+        isListening = true
+        audioGate.isOpen = true
+        phase = .listening
+        vad?.reset()
+        publishIPCState(committedText: nil, isDraftReplacement: false)
+    }
+
+    /// Feeds 16 kHz mono samples through the same VAD → ASR → Gemma path as the microphone.
+    func feedSimulatedSamples(_ samples: [Float]) {
+        processingQueue.async { [weak self] in
+            guard let self else { return }
+            let events: [SileroTurnsVAD.Event] = MainActor.assumeIsolatedOrSync { self.vad?.push(samples: samples) ?? [] }
+            self.dispatchVADEvents(events)
+        }
+    }
+
+    var isMergingSentence: Bool { refineTaskRunning || !refineQueue.isEmpty }
+
+    // MARK: - Live preview (clean-up while speaking)
+
+    /// Shows the sentence being spoken: once it has a live clean-up, that stays on screen and only the words heard
+    /// since (by length; SenseVoice re-transcribes the whole sentence, so earlier words can change) follow it dimmed.
+    private func showPartial(_ raw: String) {
+        latestPartialRaw = raw
+        (preeditText, preeditTail) = Self.previewDisplay(raw: raw, preview: livePreview)
+    }
+
+    static func previewDisplay(raw: String, preview: (raw: String, refined: String)?) -> (main: String, tail: String) {
+        guard let preview else { return (raw, "") }
+        let closing: Set<Character> = ["。", "．", ".", "？", "?", "！", "!", "，", ","]
+        func trimmed(_ s: String) -> String {
+            var s = s
+            while let last = s.last, closing.contains(last) || last.isWhitespace { s.removeLast() }
+            return s
+        }
+        // Partial transcripts end with their own full stop; only real new words count.
+        let newRaw = trimmed(raw), oldRaw = trimmed(preview.raw)
+        let extra = newRaw.count - oldRaw.count
+        guard extra > 0 else { return (preview.refined, "") }
+        // The clean-up closes the unfinished sentence; drop that while more words follow.
+        return (trimmed(preview.refined), String(newRaw.suffix(extra)))
+    }
+
+    /// While a sentence is being spoken, cleans up its partial transcript on the ANE (one preview at a time, at most
+    /// every 0.5 s, never while a finished sentence is being merged).
+    private func maybeStartPreview() {
+        guard livePreviewEnabled, aneReady, isListening, !refineTaskRunning, previewTask == nil else { return }
+        let raw = latestPartialRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard raw.count >= 4, raw != lastPreviewRequest,
+              CFAbsoluteTimeGetCurrent() - lastPreviewStart >= 0.5 else { return }
+        lastPreviewRequest = raw
+        lastPreviewStart = CFAbsoluteTimeGetCurrent()
+        let serial = utteranceSerial
+        previewTask = Task { [weak self] in
+            guard let self else { return }
+            // No earlier text as context: for a very short sentence Gemma sometimes returned the context itself.
+            let result = try? await self.refiner.previewSentence(raw: raw, context: "")
+            self.previewTask = nil
+            guard let result, self.utteranceSerial == serial, self.isListening else { return }
+            self.livePreview = (raw, result.text)
+            self.showPartial(self.latestPartialRaw)
+            self.publishIPCState(committedText: nil, isDraftReplacement: false)
+            self.maybeStartPreview()  // the transcript may have grown meanwhile
+        }
+    }
+
+    private func endLivePreview() {
+        refiner.cancelPreview()
+        utteranceSerial += 1
+        livePreview = nil
+        lastPreviewRequest = ""
+        latestPartialRaw = ""
+    }
+
     private func enqueueFinalizedSegment(_ pcm: [Float]) {
-        refineQueue.append(pcm)
+        let preview = livePreview
+        endLivePreview()
+        refineQueue.append((pcm, preview))
         if !refineTaskRunning {
             Task { await drainRefineQueue() }
         }
@@ -741,7 +846,8 @@ public final class AudioPipelineManager: ObservableObject {
         defer { refineTaskRunning = false }
 
         while !refineQueue.isEmpty {
-            let pcm = refineQueue.removeFirst()
+            let item = refineQueue.removeFirst()
+            let pcm = item.pcm
             guard let asr else { continue }
 
             phase = .transcribing
@@ -759,7 +865,8 @@ public final class AudioPipelineManager: ObservableObject {
             }
 
             phase = .refining
-            preeditText = raw
+            // While the sentence is merged, keep showing its cleaned-up preview.
+            (preeditText, preeditTail) = Self.previewDisplay(raw: raw, preview: item.preview)
             statusBanner = "Gemma 4 E2B 整理文字中…"
             publishIPCState(committedText: nil, isDraftReplacement: false)
 
@@ -781,6 +888,7 @@ public final class AudioPipelineManager: ObservableObject {
                     historyStack.append(current)
                     editorText = updated
                     preeditText = ""
+                    preeditTail = ""
                     markFreshDelta(previous: current, updated: updated)
                     updateTelemetry(res.stats)
                     let commitID = publishIPCState(committedText: updated, isDraftReplacement: true)
@@ -891,7 +999,8 @@ public final class AudioPipelineManager: ObservableObject {
             hostSessionID: hostSessionID,
             micLive: audioEngine != nil,
             micStandbyUntil: micStandby ? micStandbyUntil : 0,
-            enginesLoading: isLoadingModels
+            enginesLoading: isLoadingModels,
+            partialTail: preeditText.isEmpty ? "" : preeditTail
         )
         KomorebiIPCStore.shared.writeState(state)
         return ipcCommitID
